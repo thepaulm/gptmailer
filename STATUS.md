@@ -38,3 +38,11 @@ Note: Treat `server/.env` as the source of truth for environment values. If it c
 2. Populate `server/.env`.
 3. Run server and test voice capture + email.
 4. If testing on Android over the network, add HTTPS (tunnel or deploy).
+
+## Reminder
+- If you see OpenAI `insufficient_quota` (HTTP 429), enable API billing and add credits in the OpenAI API platform. ChatGPT Plus does not include API usage.
+
+## OpenAI Billing Runbook
+1. Sign in to the OpenAI API platform (not ChatGPT).
+2. Open Billing, add a payment method, and buy credits.
+3. Wait a couple minutes for the balance to update, then retry the app.

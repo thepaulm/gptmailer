@@ -1,0 +1,82 @@
+:root {
+  --bg: #f8f4ef;
+  --ink: #1a1a1a;
+  --accent: #1f4f3a;
+  --accent-2: #d6781c;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  background: radial-gradient(circle at top left, #fff, var(--bg));
+  color: var(--ink);
+}
+
+.wrap {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 32px 20px 48px;
+}
+
+h1 {
+  margin: 0 0 8px;
+  font-size: 28px;
+  letter-spacing: 0.4px;
+}
+
+p {
+  margin: 0 0 24px;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.record {
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 999px;
+  padding: 14px 20px;
+  font-size: 16px;
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+  transition: transform 120ms ease, background 120ms ease;
+}
+
+.record:hover {
+  background: #183c2c;
+  transform: translateY(-1px);
+}
+
+.status {
+  font-weight: 600;
+  color: var(--accent-2);
+}
+
+.log {
+  background: white;
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.08);
+}
+
+#transcript {
+  margin-top: 12px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+.line {
+  padding: 10px 12px;
+  border-left: 4px solid var(--accent);
+  background: #f6f7f5;
+  margin-bottom: 8px;
+  border-radius: 6px;
+}

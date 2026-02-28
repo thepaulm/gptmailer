@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Voice Summary Mailer</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header>
+        <h1>Voice Summary Mailer</h1>
+        <p>Tap to talk. Say “email me a summary” to send the chat by email.</p>
+      </header>
+
+      <section class="controls">
+        <button id="recordBtn" class="record">Start Recording</button>
+        <div id="status" class="status">Idle</div>
+      </section>
+
+      <section class="log">
+        <h2>Transcript</h2>
+        <div id="transcript"></div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

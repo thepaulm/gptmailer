@@ -1,6 +1,7 @@
 const recordBtn = document.getElementById("recordBtn");
 const speakToggle = document.getElementById("speakToggle");
 const voiceSelect = document.getElementById("voiceSelect");
+const speechRateSelect = document.getElementById("speechRateSelect");
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
 
@@ -20,8 +21,22 @@ let hasHeardSpeech = false;
 const SILENCE_TIMEOUT_MS = 1600;
 const VOICE_THRESHOLD = 0.02;
 
-const TRIGGER_RE = /\b(email|send)\s+(me\s+)?(a\s+)?summary\b/i;
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+const EMAIL_VERBS_RE = /\b(email|mail|send)\b/i;
+const EMAIL_ROUTE_RE = /\b(by|via|through)\s+email\b/i;
+const SUMMARY_WORD_RE = /\b(summary|recap|notes?|bullet\s*points?|takeaways?)\b/i;
+
+function wantsSummaryEmail(text) {
+  const normalized = text.toLowerCase().trim();
+  const mentionsEmail =
+    EMAIL_VERBS_RE.test(normalized) ||
+    EMAIL_ROUTE_RE.test(normalized) ||
+    /\be-?mail\b/i.test(normalized);
+  const asksForSummary =
+    SUMMARY_WORD_RE.test(normalized) ||
+    /\b(this|that|it|conversation|chat)\b/i.test(normalized);
+  return mentionsEmail && asksForSummary;
+}
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -33,6 +48,12 @@ function appendTranscript(text) {
   item.textContent = text;
   transcriptEl.appendChild(item);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function selectedSpeechRate() {
+  const raw = speechRateSelect ? Number.parseFloat(speechRateSelect.value) : 1.15;
+  if (!Number.isFinite(raw)) return 1.15;
+  return Math.min(1.4, Math.max(0.8, raw));
 }
 
 function conversationText() {
@@ -187,11 +208,12 @@ async function sendForTranscription(blob) {
     appendTranscript(`You: ${text}`);
     setStatus("Idle");
 
-    await askAssistant(text);
-
-    if (TRIGGER_RE.test(text)) {
+    if (wantsSummaryEmail(text)) {
       await sendSummaryEmail(text);
+      return;
     }
+
+    await askAssistant(text);
   } catch (err) {
     setStatus(`Error: ${err.message}`);
   }
@@ -231,6 +253,7 @@ async function askAssistant(message) {
 async function speakReply(text) {
   if (!speakToggle || !speakToggle.checked) return;
   const voice = voiceSelect ? voiceSelect.value : "alloy";
+  const speed = selectedSpeechRate();
   try {
     const resp = await fetch("/speak", {
       method: "POST",
@@ -254,6 +277,7 @@ async function speakReply(text) {
 
     const audio = new Audio(objectUrl);
     audio.dataset.url = objectUrl;
+    audio.playbackRate = speed;
     activeAudio = audio;
     await audio.play();
     await new Promise((resolve, reject) => {
@@ -292,8 +316,11 @@ async function sendSummaryEmail(latestText) {
     }
 
     const data = await resp.json();
-    appendTranscript(`(Summary emailed to ${data.to})`);
+    const confirmation = `I emailed your summary to ${data.to}.`;
+    conversation.push({ role: "assistant", content: confirmation });
+    appendTranscript(`Assistant: ${confirmation}`);
     setStatus("Idle");
+    await speakReply(confirmation);
   } catch (err) {
     setStatus(`Error: ${err.message}`);
   }

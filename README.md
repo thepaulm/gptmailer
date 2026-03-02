@@ -1,6 +1,6 @@
 # Voice Summary Mailer
 
-Minimal web app that records audio, transcribes it with OpenAI, and emails a summary via AWS SES when you say “email me a summary”.
+Minimal web app that records audio, transcribes it with OpenAI, and emails a summary via AWS SES when you ask it to email the conversation summary.
 
 ## Setup
 
@@ -39,5 +39,8 @@ Do not open `web/index.html` directly from the filesystem unless you are explici
 - Browser mic requires HTTPS on mobile. `http://localhost` works for local testing.
 - Click `Start Recording` once to begin a continuous chat session; use `End Chat` to stop.
 - The app auto-submits a turn after a brief pause in speech.
-- Say “email me a summary” to trigger the email. To send to another recipient, say the full email address in the same utterance.
+- Email summary trigger supports natural phrasing (for example: `email this`, `send this by email`, `mail me the recap`, `send me the notes`).
+- To send to another recipient, say the full email address in the same utterance.
+- After a successful send, the app posts and can speak a confirmation message (`I emailed your summary to ...`).
+- Reply speech speed is adjustable from the UI (`1.0x`, `1.15x`, `1.25x`, `1.3x`, `1.35x`, `1.4x`).
 - If SES send fails with `AccessDenied`, update IAM permissions for the AWS user to allow `ses:SendEmail`/`ses:SendRawEmail` in `us-west-2`.

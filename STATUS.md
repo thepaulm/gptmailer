@@ -5,10 +5,10 @@
 - State: working
 - Current blocker: none.
 - Last verified behavior: launch script opens app, speech defaults are `sage` + `1.3x`, and empty transcript no longer shows as 500.
-- Next step (single action): Start Slack integration MVP: read incoming Slack messages, then post bot replies.
+- Next step (single action): Resume Slack MVP by exposing local server via tunnel and wiring `/slack/events` in backend.
 - Next command to run: `./launch_app.sh`
-- Expected result: backend starts, browser opens to `http://127.0.0.1:8000`, and normal chat/TTS/email flow all work.
-- If fails, do this: verify `server/.env` keys, check backend traceback in terminal, then verify SES sandbox sender/recipient status in `us-west-2`.
+- Expected result: backend starts at `http://127.0.0.1:8000`; then create a tunnel URL and configure Slack Event Subscriptions to `https://<tunnel>/slack/events`.
+- If fails, do this: verify `server/.env` keys (including Slack vars), check backend traceback in terminal, and confirm tunnel URL is reachable.
 
 ## Goal
 Build a fully voice-enabled web app that transcribes speech, summarizes the conversation into bullet points, and emails the summary via AWS SES when the user says “email me a summary.”
@@ -45,6 +45,8 @@ Fill `server/.env` with:
 - `AWS_SECRET_ACCESS_KEY`
 - `SES_FROM_EMAIL` (verified sender email at `pgntrain.com`)
 - `DEFAULT_TO_EMAIL` (verified recipient email while SES is in sandbox; any domain is allowed)
+- `SLACK_BOT_TOKEN` (for `chat.postMessage`)
+- `SLACK_SIGNING_SECRET` (for Slack request verification)
 
 Note: Treat `server/.env` as the source of truth for environment values. If it conflicts with this file, resolve the mismatch by updating `server/.env` first and then reflect it here.
 
@@ -61,14 +63,20 @@ Note: Treat `server/.env` as the source of truth for environment values. If it c
   - better per-model exception logging
   - empty transcript no longer returns 500
 - Updated frontend to show `No speech detected. Try again.` for empty transcripts.
+- Added Slack credentials to `server/.env`:
+  - `SLACK_BOT_TOKEN`
+  - `SLACK_SIGNING_SECRET`
+- Confirmed local-only setup needs a tunnel URL (or Socket Mode) before Slack Events can reach the app.
 
 ## Next Steps
-1. Implement Slack integration phase 1: receive messages (DM + mention events), verify requests, and log payloads.
-2. Implement Slack integration phase 2: generate reply text and send responses with `chat.postMessage`.
-3. Add voice command phrases to end chat session (for example: “end chat”, “stop chat”, “we’re done”).
-4. Add optional voice command phrases to start a new chat/reset conversation context (for example: “new chat”, “start over”).
-5. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
-6. Optional hygiene: add `server/.env` to `.gitignore` to avoid accidental secret commits.
+1. Start a tunnel (for example `ngrok http 8000`) and set Slack Event Subscriptions Request URL to `https://<tunnel>/slack/events`.
+2. Implement Slack integration phase 1 in backend: verify Slack signature, handle URL verification challenge, accept DM + mention events, and log payloads.
+3. Implement Slack integration phase 2: generate reply text and send responses with `chat.postMessage`.
+4. End-to-end test in Slack (DM and channel mention) and verify no duplicate responses.
+5. Add voice command phrases to end chat session (for example: “end chat”, “stop chat”, “we’re done”).
+6. Add optional voice command phrases to start a new chat/reset conversation context (for example: “new chat”, “start over”).
+7. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
+8. Optional hygiene: add `server/.env` to `.gitignore` to avoid accidental secret commits.
 
 ## Testing URL Reminder
 - Prefer the backend-served URL `http://localhost:8000` for local testing.

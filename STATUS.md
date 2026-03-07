@@ -1,13 +1,13 @@
 # Project Status
 
 ## Session Handoff (Read First)
-- Date: 2026-03-02
+- Date: 2026-03-07
 - State: working
 - Current blocker: none.
-- Last verified behavior: saying an email intent phrase sends the summary via SES successfully.
-- Next step (single action): Add voice command phrases to end chat, and optional phrase(s) to start a new chat.
-- Next command to run: `cd server && source ~/py3/bin/activate && uvicorn app:app --reload`
-- Expected result: backend starts and app is reachable at `http://localhost:8000`; normal chat, TTS, and email summary flow all work.
+- Last verified behavior: launch script opens app, speech defaults are `sage` + `1.3x`, and empty transcript no longer shows as 500.
+- Next step (single action): Start Slack integration MVP: read incoming Slack messages, then post bot replies.
+- Next command to run: `./launch_app.sh`
+- Expected result: backend starts, browser opens to `http://127.0.0.1:8000`, and normal chat/TTS/email flow all work.
 - If fails, do this: verify `server/.env` keys, check backend traceback in terminal, then verify SES sandbox sender/recipient status in `us-west-2`.
 
 ## Goal
@@ -21,6 +21,9 @@ Build a fully voice-enabled web app that transcribes speech, summarizes the conv
 - Email-intent utterances are intercepted client-side and are not sent to `/chat`.
 - After a successful send, the assistant confirms in transcript and voice that the email was sent.
 - TTS playback speed is user-selectable (`1.0x`, `1.15x`, `1.25x`, `1.3x`, `1.35x`, `1.4x`).
+- Default TTS voice is now `sage`; default playback speed is now `1.3x`.
+- `/transcribe` now accepts both `/transcribe` and `/transcribe/`.
+- Empty transcript responses are handled as a normal no-speech case (UI prompt) instead of backend 500.
 - SES is set up in AWS **US West (Oregon)** (`us-west-2`).
 - SES is still in **sandbox**; recipients must be verified.
 - Verified sender email is `pmikesell@pgntrain.com`.
@@ -31,6 +34,7 @@ Build a fully voice-enabled web app that transcribes speech, summarizes the conv
 - `server/requirements.txt`
 - `server/.env.example`
 - `web/index.html`, `web/app.js`, `web/style.css`
+- `launch_app.sh`: starts uvicorn, waits for readiness, and opens browser
 - `README.md`
 
 ## Required Configuration
@@ -48,18 +52,23 @@ Note: Treat `server/.env` as the source of truth for environment values. If it c
 - None currently.
 
 ## Completed This Session
-- Confirmed backend startup path issue and fixed run command usage (`cd server && uvicorn app:app --reload` or `--app-dir server` from repo root).
-- Verified SES email sending works end-to-end.
-- Fixed trigger ordering bug so email requests no longer also go to `/chat`.
-- Broadened email intent detection to include natural phrasing (`email this`, `send this by email`, `mail me the recap`, etc.).
-- Added assistant send confirmation after successful email (transcript + optional spoken confirmation).
-- Added speech speed selector in UI with rates: `1.0x`, `1.15x`, `1.25x`, `1.3x`, `1.35x`, `1.4x`.
+- Added root launcher script `./launch_app.sh` to start server and open browser automatically.
+- Updated frontend defaults to voice `sage` and speed `1.3x`.
+- Added static asset cache-busting query strings in `web/index.html` to avoid stale JS/CSS.
+- Added `/transcribe/` route alias alongside `/transcribe`.
+- Improved transcription behavior:
+  - model fallback from `gpt-4o-mini-transcribe` to `whisper-1`
+  - better per-model exception logging
+  - empty transcript no longer returns 500
+- Updated frontend to show `No speech detected. Try again.` for empty transcripts.
 
 ## Next Steps
-1. Add voice command phrases to end chat session (for example: “end chat”, “stop chat”, “we’re done”).
-2. Add optional voice command phrases to start a new chat/reset conversation context (for example: “new chat”, “start over”).
-3. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
-4. Optional hygiene: add `server/.env` to `.gitignore` to avoid accidental secret commits.
+1. Implement Slack integration phase 1: receive messages (DM + mention events), verify requests, and log payloads.
+2. Implement Slack integration phase 2: generate reply text and send responses with `chat.postMessage`.
+3. Add voice command phrases to end chat session (for example: “end chat”, “stop chat”, “we’re done”).
+4. Add optional voice command phrases to start a new chat/reset conversation context (for example: “new chat”, “start over”).
+5. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
+6. Optional hygiene: add `server/.env` to `.gitignore` to avoid accidental secret commits.
 
 ## Testing URL Reminder
 - Prefer the backend-served URL `http://localhost:8000` for local testing.

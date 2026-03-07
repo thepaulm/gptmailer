@@ -35,6 +35,12 @@ uvicorn server.app:app --reload --port 8000
 Open `http://localhost:8000` (preferred for normal testing).
 Do not open `web/index.html` directly from the filesystem unless you are explicitly debugging static assets.
 
+Alternative one-command launcher (starts server + opens browser):
+
+```bash
+./launch_app.sh
+```
+
 ## Notes
 - Browser mic requires HTTPS on mobile. `http://localhost` works for local testing.
 - Click `Start Recording` once to begin a continuous chat session; use `End Chat` to stop.
@@ -43,4 +49,11 @@ Do not open `web/index.html` directly from the filesystem unless you are explici
 - To send to another recipient, say the full email address in the same utterance.
 - After a successful send, the app posts and can speak a confirmation message (`I emailed your summary to ...`).
 - Reply speech speed is adjustable from the UI (`1.0x`, `1.15x`, `1.25x`, `1.3x`, `1.35x`, `1.4x`).
+- Default reply voice is `sage` and default speech speed is `1.3x`.
+- If transcription returns no recognized speech, the UI now shows `No speech detected. Try again.` instead of a server error.
 - If SES send fails with `AccessDenied`, update IAM permissions for the AWS user to allow `ses:SendEmail`/`ses:SendRawEmail` in `us-west-2`.
+
+## Next Milestone
+- Slack integration MVP:
+  - Read incoming Slack messages (start with mentions/DMs)
+  - Post bot responses back to Slack

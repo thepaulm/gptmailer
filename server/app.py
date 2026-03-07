@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 import io
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +29,7 @@ if not (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and SES_FROM_EMAIL and DEFAU
     raise RuntimeError("Missing AWS/SES environment variables")
 
 client = OpenAI()
+logger = logging.getLogger(__name__)
 
 ses = boto3.client(
     "ses",
@@ -104,6 +106,7 @@ def index():
 
 
 @app.post("/transcribe")
+@app.post("/transcribe/")
 async def transcribe(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename")
@@ -113,28 +116,43 @@ async def transcribe(file: UploadFile = File(...)):
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Empty audio")
 
+    transcript = None
+    model_errors: list[str] = []
     with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
         tmp.write(audio_bytes)
         tmp.flush()
-        with open(tmp.name, "rb") as audio_f:
-            transcript = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=audio_f,
-                response_format="json",
-            )
+
+        for model in ("gpt-4o-mini-transcribe", "whisper-1"):
+            try:
+                with open(tmp.name, "rb") as audio_f:
+                    transcript = client.audio.transcriptions.create(
+                        model=model,
+                        file=audio_f,
+                        response_format="json",
+                    )
+                break
+            except Exception as exc:
+                err_msg = f"{type(exc).__name__}: {exc}"
+                model_errors.append(f"{model}: {err_msg}")
+                logger.exception("Transcription failed with model %s", model)
 
     text = getattr(transcript, "text", None)
-    if not text and isinstance(transcript, dict):
+    if text is None and isinstance(transcript, dict):
         text = transcript.get("text")
-    if not text and hasattr(transcript, "model_dump"):
+    if text is None and hasattr(transcript, "model_dump"):
         try:
             text = transcript.model_dump().get("text")
         except Exception:
             text = None
-    if not text:
+    if text is None:
+        if model_errors:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Transcription failed. Attempts: {' | '.join(model_errors)}",
+            )
         raise HTTPException(status_code=500, detail="No transcript returned")
 
-    return JSONResponse({"text": text})
+    return JSONResponse({"text": text.strip()})
 
 
 @app.post("/summarize_email")

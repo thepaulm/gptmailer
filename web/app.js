@@ -5,6 +5,13 @@ const speechRateSelect = document.getElementById("speechRateSelect");
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
 
+if (voiceSelect) {
+  voiceSelect.value = "sage";
+}
+if (speechRateSelect) {
+  speechRateSelect.value = "1.3";
+}
+
 let recorder = null;
 let chunks = [];
 let isRecording = false;
@@ -51,8 +58,8 @@ function appendTranscript(text) {
 }
 
 function selectedSpeechRate() {
-  const raw = speechRateSelect ? Number.parseFloat(speechRateSelect.value) : 1.15;
-  if (!Number.isFinite(raw)) return 1.15;
+  const raw = speechRateSelect ? Number.parseFloat(speechRateSelect.value) : 1.3;
+  if (!Number.isFinite(raw)) return 1.3;
   return Math.min(1.4, Math.max(0.8, raw));
 }
 
@@ -201,8 +208,11 @@ async function sendForTranscription(blob) {
     }
 
     const data = await resp.json();
-    const text = data.text.trim();
-    if (!text) throw new Error("Empty transcript");
+    const text = (data.text || "").trim();
+    if (!text) {
+      setStatus("No speech detected. Try again.");
+      return;
+    }
 
     conversation.push({ role: "user", content: text });
     appendTranscript(`You: ${text}`);
@@ -252,7 +262,7 @@ async function askAssistant(message) {
 
 async function speakReply(text) {
   if (!speakToggle || !speakToggle.checked) return;
-  const voice = voiceSelect ? voiceSelect.value : "alloy";
+  const voice = voiceSelect ? voiceSelect.value : "sage";
   const speed = selectedSpeechRate();
   try {
     const resp = await fetch("/speak", {

@@ -1,14 +1,14 @@
 # Project Status
 
 ## Session Handoff (Read First)
-- Date: 2026-03-07
+- Date: 2026-03-08
 - State: working
 - Current blocker: none.
-- Last verified behavior: launch script opens app, speech defaults are `sage` + `1.3x`, and empty transcript no longer shows as 500.
-- Next step (single action): Set up TLS certificate on EC2 domain so the external HTTPS URL can be used as the Slack Events endpoint.
-- Next command to run: `sudo certbot --nginx -d <your-domain> [-d www.<your-domain>]`
-- Expected result: valid HTTPS is enabled on EC2 domain; then configure Slack Event Subscriptions to `https://<your-domain>/slack/events`.
-- If fails, do this: verify DNS A record points to EC2 static IP, confirm security group allows ports 80/443, check Nginx server block for domain, and rerun certbot with logs.
+- Last verified behavior: launch script opens app, speech defaults are `sage` + `1.3x`, empty transcript no longer shows as 500, and user reports HTTPS is working at the EC2 domain.
+- Next step (single action): Run the FastAPI backend on EC2 behind Nginx so Slack can verify `https://<your-domain>/slack/events`.
+- Next command to run: `curl -i https://<your-domain>/slack/events` (after backend is running and Nginx is proxying).
+- Expected result: endpoint is publicly reachable (non-404 app response), then Slack Event Subscriptions can verify the Request URL.
+- If fails, do this: confirm uvicorn process is running, verify Nginx `location` forwards to backend port, check security group/NACL rules for 80/443, and inspect `sudo journalctl -u <your-service> -n 200` plus Nginx error logs.
 
 ## Goal
 Build a fully voice-enabled web app that transcribes speech, summarizes the conversation into bullet points, and emails the summary via AWS SES when the user says “email me a summary.”
@@ -26,7 +26,7 @@ Build a fully voice-enabled web app that transcribes speech, summarizes the conv
 - Empty transcript responses are handled as a normal no-speech case (UI prompt) instead of backend 500.
 - SES is set up in AWS **US West (Oregon)** (`us-west-2`).
 - SES is still in **sandbox**; recipients must be verified.
-- Verified sender email is `pmikesell@pgntrain.com`.
+- Verified sender email is configured in `server/.env`.
 - Credential source is IAM user static access keys in `server/.env`.
 
 ## Files Added
@@ -43,7 +43,7 @@ Fill `server/.env` with:
 - `AWS_REGION=us-west-2` (SES is in us-west-2; ensure `.env` is not `us-east-1`)
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
-- `SES_FROM_EMAIL` (verified sender email at `pgntrain.com`)
+- `SES_FROM_EMAIL` (a verified sender email/domain in SES)
 - `DEFAULT_TO_EMAIL` (verified recipient email while SES is in sandbox; any domain is allowed)
 - `SLACK_BOT_TOKEN` (for `chat.postMessage`)
 - `SLACK_SIGNING_SECRET` (for Slack request verification)
@@ -67,17 +67,20 @@ Note: Treat `server/.env` as the source of truth for environment values. If it c
   - `SLACK_BOT_TOKEN`
   - `SLACK_SIGNING_SECRET`
 - Confirmed local-only setup needs a tunnel URL (or Socket Mode) before Slack Events can reach the app.
+- User installed Certbot nginx plugin on EC2 and reported HTTPS works for the main domain.
+- Clarified deployment model: Slack Events require backend (FastAPI/uvicorn) on a public host (EC2 or tunnel), while frontend is browser-loaded static assets.
 
 ## Next Steps
-1. Set up TLS cert on EC2/domain (Let’s Encrypt via certbot) so external HTTPS URL is ready.
-2. Configure Slack Event Subscriptions Request URL to `https://<your-domain>/slack/events`.
-3. Implement Slack integration phase 1 in backend: verify Slack signature, handle URL verification challenge, accept DM + mention events, and log payloads.
-4. Implement Slack integration phase 2: generate reply text and send responses with `chat.postMessage`.
-5. End-to-end test in Slack (DM and channel mention) and verify no duplicate responses.
-6. Add voice command phrases to end chat session (for example: “end chat”, “stop chat”, “we’re done”).
-7. Add optional voice command phrases to start a new chat/reset conversation context (for example: “new chat”, “start over”).
-8. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
-9. Optional hygiene: add `server/.env` to `.gitignore` to avoid accidental secret commits.
+1. Deploy backend process on EC2 (systemd `uvicorn` service recommended) and confirm Nginx proxies to it.
+2. Verify public endpoint `https://<your-domain>/slack/events` is reachable from the internet.
+3. Configure Slack Event Subscriptions Request URL to `https://<your-domain>/slack/events`.
+4. Implement Slack integration phase 1 in backend: verify Slack signature, handle URL verification challenge, accept DM + mention events, and log payloads.
+5. Implement Slack integration phase 2: generate reply text and send responses with `chat.postMessage`.
+6. End-to-end test in Slack (DM and channel mention) and verify no duplicate responses.
+7. Add voice command phrases to end chat session (for example: “end chat”, “stop chat”, “we’re done”).
+8. Add optional voice command phrases to start a new chat/reset conversation context (for example: “new chat”, “start over”).
+9. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
+10. Optional hygiene: add `server/.env` to `.gitignore` to avoid accidental secret commits.
 
 ## Testing URL Reminder
 - Prefer the backend-served URL `http://localhost:8000` for local testing.

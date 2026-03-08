@@ -57,3 +57,9 @@ Alternative one-command launcher (starts server + opens browser):
 - Slack integration MVP:
   - Read incoming Slack messages (start with mentions/DMs)
   - Post bot responses back to Slack
+
+## Deployment Note (Slack Events)
+- For Slack Event Subscriptions, the backend endpoint must be publicly reachable over HTTPS.
+- In this project, backend means FastAPI served by `uvicorn` (`server/app.py` endpoints, including `/slack/events`).
+- Frontend means the static files in `web/` (`index.html`, `app.js`, `style.css`) that run in the browser.
+- Running only on a desktop `localhost` is not enough for Slack Events unless you use a tunnel URL (for example ngrok/Cloudflare Tunnel).

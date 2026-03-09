@@ -5,10 +5,10 @@
 - State: working
 - Current blocker: none.
 - Last verified behavior: launch script starts server and prints URL by default (`--open` opens browser), speech defaults are `sage` + `1.3x`, empty transcript no longer shows as 500, and user reports HTTPS is working at the EC2 domain.
-- Next step (single action): Run the FastAPI backend on EC2 behind Nginx so Slack can verify `https://<your-domain>/slack/events`.
-- Next command to run: `curl -i https://<your-domain>/slack/events` (after backend is running and Nginx is proxying).
-- Expected result: endpoint is publicly reachable (non-404 app response), then Slack Event Subscriptions can verify the Request URL.
-- If fails, do this: confirm uvicorn process is running, verify Nginx `location` forwards to backend port, check security group/NACL rules for 80/443, and inspect `sudo journalctl -u <your-service> -n 200` plus Nginx error logs.
+- Next step (single action): Implement Slack user OAuth flow so the app can use the signed-in user's token (not bot token) to read personal history and send replies as that user.
+- Next command to run: inspect current Slack app scopes/settings and design OAuth callback storage path in backend.
+- Expected result: authenticated user token is available server-side for `/chat` Slack intents; app can read that user's own DM/channel history and prepare/send replies with explicit confirmation.
+- If fails, do this: verify Slack user scopes are requested, reinstall app, confirm token persistence, and check backend logs for OAuth/token errors.
 
 ## Goal
 Build a fully voice-enabled web app that transcribes speech, summarizes the conversation into bullet points, and emails the summary via AWS SES when the user says “email me a summary.”
@@ -63,7 +63,8 @@ Fill `server/.env` with:
 Note: Treat `server/.env` as the source of truth for environment values. If it conflicts with this file, resolve the mismatch by updating `server/.env` first and then reflect it here.
 
 ## Open Questions
-- None currently.
+- Should we store Slack user tokens in a local encrypted file/db for now, or add a managed secret/data store immediately?
+- For send-on-behalf actions, what explicit confirmation UX is preferred in web chat (single-turn yes/no vs. separate "Send" action)?
 
 ## Completed This Session
 - Added `PORT` support via `server/.env`.
@@ -96,18 +97,31 @@ Note: Treat `server/.env` as the source of truth for environment values. If it c
 - Confirmed local-only setup needs a tunnel URL (or Socket Mode) before Slack Events can reach the app.
 - User installed Certbot nginx plugin on EC2 and reported HTTPS works for the main domain.
 - Clarified deployment model: Slack Events require backend (FastAPI/uvicorn) on a public host (EC2 or tunnel), while frontend is browser-loaded static assets.
+- Implemented Slack integration phase 1 in backend:
+  - `GET /slack/events` reachability response
+  - `POST /slack/events` with Slack signature verification (`X-Slack-Signature`, timestamp skew check)
+  - URL verification challenge response (`type=url_verification`)
+  - Accept DM/app_mention events and log payload metadata
+  - Ignore bot_message subtype and non-target event types
+- Implemented Slack integration phase 2 (initial command flow):
+  - DM/app mention commands now trigger `chat.postMessage` replies.
+  - Added command: `last message from <@user>` (or username/display name).
+  - Bot reads channel history via `conversations.history`, finds latest matching user message, and replies with quote + permalink.
+- Added Slack lookup intent in web chat UI (`POST /chat` path):
+  - Prompts like `last message from Alex` / `last a slack message from Alex` are intercepted.
+  - Backend resolves Slack user, opens DM conversation, fetches latest message from that person, and returns it in chat reply.
+- Confirmed product direction: support reading user's personal Slack history and replying as the user (requires user OAuth tokens and explicit send confirmation flow).
 
 ## Next Steps
-1. Deploy backend process on EC2 (systemd `uvicorn` service recommended) and confirm Nginx proxies to it.
-2. Verify public endpoint `https://<your-domain>/slack/events` is reachable from the internet.
-3. Configure Slack Event Subscriptions Request URL to `https://<your-domain>/slack/events`.
-4. Implement Slack integration phase 1 in backend: verify Slack signature, handle URL verification challenge, accept DM + mention events, and log payloads.
-5. Implement Slack integration phase 2: generate reply text and send responses with `chat.postMessage`.
-6. End-to-end test in Slack (DM and channel mention) and verify no duplicate responses.
+1. Implement Slack user OAuth install/login flow and callback handling in backend.
+2. Store per-user Slack tokens securely and map them to authenticated web sessions.
+3. Update `/chat` Slack lookup intent to use the signed-in user's token (personal history access).
+4. Add "send as me" action with explicit confirmation before sending.
+5. End-to-end test user-token flow (read + draft + confirm send) and verify permissions/scopes.
+6. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
 7. Add voice command phrases to end chat session (for example: “end chat”, “stop chat”, “we’re done”).
 8. Add optional voice command phrases to start a new chat/reset conversation context (for example: “new chat”, “start over”).
-9. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
-10. Optional hygiene: add `server/.env` to `.gitignore` to avoid accidental secret commits.
+9. Optional hygiene: add `server/.env` to `.gitignore` to avoid accidental secret commits.
 
 ## Testing URL Reminder
 - Prefer the backend-served URL `http://localhost:8000` for local testing.

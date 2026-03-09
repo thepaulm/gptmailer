@@ -30,6 +30,26 @@ p {
   margin: 0 0 24px;
 }
 
+.auth {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+#authUser {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.auth button {
+  border: 1px solid #b9b9b9;
+  background: white;
+  border-radius: 8px;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+
 .controls {
   display: flex;
   align-items: center;
@@ -52,6 +72,12 @@ p {
 .record:hover {
   background: #183c2c;
   transform: translateY(-1px);
+}
+
+.record:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
 }
 
 .status {

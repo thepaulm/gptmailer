@@ -4,13 +4,18 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Voice Summary Mailer</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260307-1" />
+    <link rel="stylesheet" href="/static/style.css?v=20260308-2" />
   </head>
   <body>
     <main class="wrap">
       <header>
         <h1>Voice Summary Mailer</h1>
         <p>Tap to talk. Say “email me a summary” to send the chat by email.</p>
+        <div class="auth">
+          <span id="authUser">Not signed in</span>
+          <button id="loginBtn" type="button">Sign in with Google</button>
+          <button id="logoutBtn" type="button" hidden>Sign out</button>
+        </div>
       </header>
 
       <section class="controls">
@@ -54,6 +59,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260307-1"></script>
+    <script src="/static/app.js?v=20260308-2"></script>
   </body>
 </html>

@@ -2,6 +2,9 @@ const recordBtn = document.getElementById("recordBtn");
 const speakToggle = document.getElementById("speakToggle");
 const voiceSelect = document.getElementById("voiceSelect");
 const speechRateSelect = document.getElementById("speechRateSelect");
+const loginBtn = document.getElementById("loginBtn");
+const logoutBtn = document.getElementById("logoutBtn");
+const authUserEl = document.getElementById("authUser");
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
 
@@ -24,6 +27,7 @@ let sourceNode = null;
 let silenceTimer = null;
 let silenceRafId = null;
 let hasHeardSpeech = false;
+let isAuthenticated = false;
 
 const SILENCE_TIMEOUT_MS = 1600;
 const VOICE_THRESHOLD = 0.02;
@@ -47,6 +51,44 @@ function wantsSummaryEmail(text) {
 
 function setStatus(text) {
   statusEl.textContent = text;
+}
+
+function setAuthUi() {
+  recordBtn.disabled = !isAuthenticated;
+  if (isAuthenticated) {
+    loginBtn.hidden = true;
+    logoutBtn.hidden = false;
+  } else {
+    loginBtn.hidden = false;
+    logoutBtn.hidden = true;
+    sessionActive = false;
+    if (isRecording) stopRecording();
+    recordBtn.textContent = "Start Recording";
+  }
+}
+
+async function refreshAuth() {
+  try {
+    const resp = await fetch("/auth/me");
+    if (!resp.ok) throw new Error("auth check failed");
+    const data = await resp.json();
+    isAuthenticated = !!data.authenticated;
+    if (isAuthenticated && data.user) {
+      const displayName = data.user.name || data.user.email || "Signed in";
+      authUserEl.textContent = `Signed in: ${displayName}`;
+      if (statusEl.textContent === "Sign in required") {
+        setStatus("Idle");
+      }
+    } else {
+      authUserEl.textContent = "Not signed in";
+      setStatus("Sign in required");
+    }
+  } catch (err) {
+    isAuthenticated = false;
+    authUserEl.textContent = "Not signed in";
+    setStatus("Sign in required");
+  }
+  setAuthUi();
 }
 
 function appendTranscript(text) {
@@ -338,6 +380,10 @@ async function sendSummaryEmail(latestText) {
 
 recordBtn.addEventListener("click", async () => {
   try {
+    if (!isAuthenticated) {
+      setStatus("Sign in required");
+      return;
+    }
     if (!sessionActive) {
       sessionActive = true;
       try {
@@ -363,3 +409,18 @@ recordBtn.addEventListener("click", async () => {
     setStatus(`Error: ${err.message}`);
   }
 });
+
+loginBtn.addEventListener("click", () => {
+  window.location.href = "/auth/google/login";
+});
+
+logoutBtn.addEventListener("click", async () => {
+  try {
+    await fetch("/auth/logout", { method: "POST" });
+  } catch (err) {
+    // no-op: auth refresh below handles final UI state
+  }
+  await refreshAuth();
+});
+
+refreshAuth();

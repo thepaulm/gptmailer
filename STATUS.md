@@ -4,7 +4,7 @@
 - Date: 2026-03-08
 - State: working
 - Current blocker: none.
-- Last verified behavior: launch script opens app, speech defaults are `sage` + `1.3x`, empty transcript no longer shows as 500, and user reports HTTPS is working at the EC2 domain.
+- Last verified behavior: launch script starts server and prints URL by default (`--open` opens browser), speech defaults are `sage` + `1.3x`, empty transcript no longer shows as 500, and user reports HTTPS is working at the EC2 domain.
 - Next step (single action): Run the FastAPI backend on EC2 behind Nginx so Slack can verify `https://<your-domain>/slack/events`.
 - Next command to run: `curl -i https://<your-domain>/slack/events` (after backend is running and Nginx is proxying).
 - Expected result: endpoint is publicly reachable (non-404 app response), then Slack Event Subscriptions can verify the Request URL.
@@ -15,6 +15,8 @@ Build a fully voice-enabled web app that transcribes speech, summarizes the conv
 
 ## Current State
 - A minimal FastAPI backend and static web frontend are scaffolded.
+- Google OAuth login is now added (Google sign-in, callback, session cookie, auth status, logout).
+- Backend API routes now require authentication by default (configurable via `AUTH_REQUIRED`).
 - The app records audio continuously in session mode, transcribes it with OpenAI, gets ChatGPT replies, and can speak replies via OpenAI TTS.
 - Recording now auto-submits on silence after speech is detected.
 - Natural email-intent phrases now trigger SES email sending flow (not just one exact phrase).
@@ -34,12 +36,16 @@ Build a fully voice-enabled web app that transcribes speech, summarizes the conv
 - `server/requirements.txt`
 - `server/.env.example`
 - `web/index.html`, `web/app.js`, `web/style.css`
-- `launch_app.sh`: starts uvicorn, waits for readiness, and opens browser
+- `launch_app.sh`: starts uvicorn, waits for readiness, and can open browser with `--open`
 - `README.md`
 
 ## Required Configuration
 Fill `server/.env` with:
 - `OPENAI_API_KEY`
+- `PORT=8000` (or your preferred backend port)
+- `HOST=0.0.0.0` (for EC2/public binding)
+- `SSL_CERTFILE` (optional; set with `SSL_KEYFILE` to enable HTTPS directly in uvicorn)
+- `SSL_KEYFILE` (optional; set with `SSL_CERTFILE` to enable HTTPS directly in uvicorn)
 - `AWS_REGION=us-west-2` (SES is in us-west-2; ensure `.env` is not `us-east-1`)
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
@@ -47,6 +53,12 @@ Fill `server/.env` with:
 - `DEFAULT_TO_EMAIL` (verified recipient email while SES is in sandbox; any domain is allowed)
 - `SLACK_BOT_TOKEN` (for `chat.postMessage`)
 - `SLACK_SIGNING_SECRET` (for Slack request verification)
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REDIRECT_URI`
+- `AUTH_REQUIRED=true` (default)
+- `AUTH_COOKIE_SECURE=true` on HTTPS hosts (`false` for local HTTP only)
+- `ALLOWED_GOOGLE_EMAIL` (optional strict single-user Google login allowlist)
 
 Note: Treat `server/.env` as the source of truth for environment values. If it conflicts with this file, resolve the mismatch by updating `server/.env` first and then reflect it here.
 
@@ -54,7 +66,22 @@ Note: Treat `server/.env` as the source of truth for environment values. If it c
 - None currently.
 
 ## Completed This Session
-- Added root launcher script `./launch_app.sh` to start server and open browser automatically.
+- Added `PORT` support via `server/.env`.
+- Updated `launch_app.sh` to source `server/.env` so `PORT`/`HOST` are applied automatically.
+- Updated `launch_app.sh` so browser auto-open only happens when `--open` is passed.
+- Added optional TLS startup in `launch_app.sh` via `SSL_CERTFILE` + `SSL_KEYFILE`.
+- Pinned `httpx<0.28` in `server/requirements.txt` to fix OpenAI client startup (`proxies` argument mismatch).
+- Added Google OAuth endpoints in backend:
+  - `GET /auth/google/login`
+  - `GET /auth/google/callback`
+  - `GET /auth/me`
+  - `POST /auth/logout`
+- Added in-memory session management with secure/httponly cookie.
+- Added auth guard to `/transcribe`, `/chat`, `/speak`, and `/summarize_email`.
+- Added frontend sign-in/sign-out controls and blocked recording until authenticated.
+- Added optional strict Google single-user allowlist via `ALLOWED_GOOGLE_EMAIL`.
+- Updated `server/.env.example` and `README.md` with Google OAuth + cookie config.
+- Added root launcher script `./launch_app.sh` to start server; pass `--open` to open browser automatically.
 - Updated frontend defaults to voice `sage` and speed `1.3x`.
 - Added static asset cache-busting query strings in `web/index.html` to avoid stale JS/CSS.
 - Added `/transcribe/` route alias alongside `/transcribe`.

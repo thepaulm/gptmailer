@@ -3,13 +3,18 @@ import re
 import tempfile
 import io
 import logging
+import json
+import secrets
+import time
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 import boto3
@@ -22,6 +27,14 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 SES_FROM_EMAIL = os.getenv("SES_FROM_EMAIL")
 DEFAULT_TO_EMAIL = os.getenv("DEFAULT_TO_EMAIL")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "gptmailer_session")
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
+AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "true").lower() != "false"
+AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true").lower() != "false"
+ALLOWED_GOOGLE_EMAIL = (os.getenv("ALLOWED_GOOGLE_EMAIL") or "").strip().lower()
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
@@ -30,6 +43,7 @@ if not (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and SES_FROM_EMAIL and DEFAU
 
 client = OpenAI()
 logger = logging.getLogger(__name__)
+sessions: dict[str, dict] = {}
 
 ses = boto3.client(
     "ses",
@@ -76,6 +90,47 @@ CHAT_SYSTEM_PROMPT = (
 )
 
 
+def _json_post(url: str, form_data: dict) -> dict:
+    body = urlencode(form_data).encode("utf-8")
+    req = Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _json_get(url: str, headers: dict | None = None) -> dict:
+    req = Request(url, headers=headers or {}, method="GET")
+    with urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _session_from_request(request: FastAPIRequest) -> dict | None:
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_id:
+        return None
+    entry = sessions.get(session_id)
+    if not entry:
+        return None
+    now = int(time.time())
+    if entry.get("expires_at", 0) <= now:
+        sessions.pop(session_id, None)
+        return None
+    return entry
+
+
+def _require_auth(request: FastAPIRequest) -> dict:
+    if not AUTH_REQUIRED:
+        return {"sub": "anonymous", "email": "anonymous@local"}
+    session = _session_from_request(request)
+    if not session:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return session
+
+
 def _extract_output_text(resp) -> str:
     if hasattr(resp, "output_text") and resp.output_text:
         return resp.output_text
@@ -105,9 +160,125 @@ def index():
     return FileResponse(WEB_DIR / "index.html")
 
 
+@app.get("/auth/google/login")
+def auth_google_login():
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI):
+        raise HTTPException(status_code=500, detail="Google OAuth is not configured")
+
+    state = secrets.token_urlsafe(24)
+    params = urlencode(
+        {
+            "client_id": GOOGLE_CLIENT_ID,
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": state,
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+    )
+    response = RedirectResponse(
+        url=f"https://accounts.google.com/o/oauth2/v2/auth?{params}", status_code=302
+    )
+    response.set_cookie(
+        "g_oauth_state",
+        state,
+        max_age=600,
+        httponly=True,
+        samesite="lax",
+        secure=AUTH_COOKIE_SECURE,
+    )
+    return response
+
+
+@app.get("/auth/google/callback")
+def auth_google_callback(request: FastAPIRequest, code: str | None = None, state: str | None = None):
+    expected_state = request.cookies.get("g_oauth_state")
+    if not code or not state or not expected_state or state != expected_state:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI):
+        raise HTTPException(status_code=500, detail="Google OAuth is not configured")
+
+    try:
+        token_data = _json_post(
+            "https://oauth2.googleapis.com/token",
+            {
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": GOOGLE_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            },
+        )
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise RuntimeError("No access token returned")
+        userinfo = _json_get(
+            "https://openidconnect.googleapis.com/v1/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    except Exception as exc:
+        logger.exception("Google OAuth callback failed")
+        raise HTTPException(status_code=400, detail=f"OAuth exchange failed: {exc}") from exc
+
+    user_email = (userinfo.get("email") or "").strip().lower()
+    if ALLOWED_GOOGLE_EMAIL and user_email != ALLOWED_GOOGLE_EMAIL:
+        raise HTTPException(status_code=403, detail="This Google account is not allowed")
+
+    session_id = secrets.token_urlsafe(32)
+    sessions[session_id] = {
+        "sub": userinfo.get("sub"),
+        "email": userinfo.get("email"),
+        "name": userinfo.get("name"),
+        "picture": userinfo.get("picture"),
+        "expires_at": int(time.time()) + SESSION_TTL_SECONDS,
+    }
+
+    response = RedirectResponse(url="/", status_code=302)
+    response.delete_cookie("g_oauth_state")
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        session_id,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=AUTH_COOKIE_SECURE,
+    )
+    return response
+
+
+@app.get("/auth/me")
+def auth_me(request: FastAPIRequest):
+    session = _session_from_request(request)
+    if not session:
+        return JSONResponse({"authenticated": False})
+    return JSONResponse(
+        {
+            "authenticated": True,
+            "user": {
+                "sub": session.get("sub"),
+                "email": session.get("email"),
+                "name": session.get("name"),
+                "picture": session.get("picture"),
+            },
+        }
+    )
+
+
+@app.post("/auth/logout")
+def auth_logout(request: FastAPIRequest):
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if session_id:
+        sessions.pop(session_id, None)
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
+
+
 @app.post("/transcribe")
 @app.post("/transcribe/")
-async def transcribe(file: UploadFile = File(...)):
+async def transcribe(request: FastAPIRequest, file: UploadFile = File(...)):
+    _require_auth(request)
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename")
 
@@ -156,7 +327,8 @@ async def transcribe(file: UploadFile = File(...)):
 
 
 @app.post("/summarize_email")
-async def summarize_email(payload: dict):
+async def summarize_email(request: FastAPIRequest, payload: dict):
+    _require_auth(request)
     conversation = payload.get("conversation")
     to_email = payload.get("to") or DEFAULT_TO_EMAIL
 
@@ -191,7 +363,8 @@ async def summarize_email(payload: dict):
 
 
 @app.post("/chat")
-async def chat(payload: dict):
+async def chat(request: FastAPIRequest, payload: dict):
+    _require_auth(request)
     message = payload.get("message")
     history = payload.get("history", [])
 
@@ -221,7 +394,8 @@ async def chat(payload: dict):
 
 
 @app.post("/speak")
-async def speak(payload: dict):
+async def speak(request: FastAPIRequest, payload: dict):
+    _require_auth(request)
     text = payload.get("text")
     voice = payload.get("voice", "alloy")
     if not text or not isinstance(text, str):

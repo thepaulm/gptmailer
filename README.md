@@ -35,6 +35,13 @@ Fill in:
 - `AUTH_REQUIRED` (`true` to require login before API usage)
 - `AUTH_COOKIE_SECURE` (`false` for local HTTP, `true` for HTTPS/EC2)
 - `ALLOWED_GOOGLE_EMAIL` (optional; if set, only this exact Google email can sign in)
+- `SLACK_CLIENT_ID`
+- `SLACK_CLIENT_SECRET`
+- `SLACK_REDIRECT_URI` (example local: `http://localhost:8000/auth/slack/callback`)
+- `SLACK_USER_SCOPES` (default includes DM/history/send scopes for user token flow)
+- `SLACK_TOKEN_STORE_PATH` (local JSON store for per-user Slack tokens)
+- `SLACK_BOT_TOKEN` (optional; only needed for `/slack/events` bot endpoint)
+- `SLACK_SIGNING_SECRET` (optional; only needed for `/slack/events` bot endpoint)
 
 3. Run server:
 
@@ -61,6 +68,11 @@ If both `SSL_CERTFILE` and `SSL_KEYFILE` are set, it starts uvicorn with HTTPS.
   - `GET /auth/google/callback`
   - `GET /auth/me`
   - `POST /auth/logout`
+- Slack user OAuth routes:
+  - `GET /auth/slack/login`
+  - `GET /auth/slack/callback`
+  - `GET /auth/slack/status`
+  - `POST /auth/slack/disconnect`
 - Browser mic requires HTTPS on mobile. `http://localhost` works for local testing.
 - Click `Start Recording` once to begin a continuous chat session; use `End Chat` to stop.
 - The app auto-submits a turn after a brief pause in speech.
@@ -72,10 +84,18 @@ If both `SSL_CERTFILE` and `SSL_KEYFILE` are set, it starts uvicorn with HTTPS.
 - If transcription returns no recognized speech, the UI now shows `No speech detected. Try again.` instead of a server error.
 - If SES send fails with `AccessDenied`, update IAM permissions for the AWS user to allow `ses:SendEmail`/`ses:SendRawEmail` in `us-west-2`.
 
-## Next Milestone
-- Slack integration MVP:
-  - Read incoming Slack messages (start with mentions/DMs)
-  - Post bot responses back to Slack
+## Slack User Flow
+- Sign in with Google, then click `Connect Slack`.
+- Ask: `latest slack messages to me` (or `read my slack`) to fetch recent incoming DMs.
+- Fetch a specific user’s latest DM with: `last slack message from <name>`.
+- Draft a reply with either:
+  - `reply to <name>: your message`
+  - `send slack message to <name>: your message`
+  - `send message to <name>: your message`
+- Confirm with `send it` (also accepts `send it.` / `send it!`) or cancel with `cancel`.
+- Messages are sent with your Slack user token, not a bot token.
+- User-facing responses prefer friendly names (not raw Slack user IDs).
+- Permalink lookup is best-effort; message reads/sends continue even if Slack permalink generation fails.
 
 ## Deployment Note (Slack Events)
 - For Slack Event Subscriptions, the backend endpoint must be publicly reachable over HTTPS.

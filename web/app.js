@@ -4,6 +4,9 @@ const voiceSelect = document.getElementById("voiceSelect");
 const speechRateSelect = document.getElementById("speechRateSelect");
 const loginBtn = document.getElementById("loginBtn");
 const logoutBtn = document.getElementById("logoutBtn");
+const slackStatusEl = document.getElementById("slackStatus");
+const slackConnectBtn = document.getElementById("slackConnectBtn");
+const slackDisconnectBtn = document.getElementById("slackDisconnectBtn");
 const authUserEl = document.getElementById("authUser");
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
@@ -28,24 +31,23 @@ let silenceTimer = null;
 let silenceRafId = null;
 let hasHeardSpeech = false;
 let isAuthenticated = false;
+let isSlackConnected = false;
 
 const SILENCE_TIMEOUT_MS = 1600;
 const VOICE_THRESHOLD = 0.02;
 
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
-const EMAIL_VERBS_RE = /\b(email|mail|send)\b/i;
+const EMAIL_WORD_RE = /\b(e-?mail|mail)\b/i;
 const EMAIL_ROUTE_RE = /\b(by|via|through)\s+email\b/i;
 const SUMMARY_WORD_RE = /\b(summary|recap|notes?|bullet\s*points?|takeaways?)\b/i;
 
 function wantsSummaryEmail(text) {
   const normalized = text.toLowerCase().trim();
   const mentionsEmail =
-    EMAIL_VERBS_RE.test(normalized) ||
-    EMAIL_ROUTE_RE.test(normalized) ||
-    /\be-?mail\b/i.test(normalized);
+    EMAIL_WORD_RE.test(normalized) || EMAIL_ROUTE_RE.test(normalized);
   const asksForSummary =
     SUMMARY_WORD_RE.test(normalized) ||
-    /\b(this|that|it|conversation|chat)\b/i.test(normalized);
+    /\b(this|that|conversation|chat)\b/i.test(normalized);
   return mentionsEmail && asksForSummary;
 }
 
@@ -58,12 +60,42 @@ function setAuthUi() {
   if (isAuthenticated) {
     loginBtn.hidden = true;
     logoutBtn.hidden = false;
+    if (slackConnectBtn) slackConnectBtn.hidden = isSlackConnected;
+    if (slackDisconnectBtn) slackDisconnectBtn.hidden = !isSlackConnected;
   } else {
     loginBtn.hidden = false;
     logoutBtn.hidden = true;
+    if (slackConnectBtn) slackConnectBtn.hidden = true;
+    if (slackDisconnectBtn) slackDisconnectBtn.hidden = true;
+    if (slackStatusEl) slackStatusEl.textContent = "Slack: not connected";
     sessionActive = false;
     if (isRecording) stopRecording();
     recordBtn.textContent = "Start Recording";
+  }
+}
+
+async function refreshSlackStatus() {
+  if (!isAuthenticated) {
+    isSlackConnected = false;
+    if (slackStatusEl) slackStatusEl.textContent = "Slack: not connected";
+    return;
+  }
+  try {
+    const resp = await fetch("/auth/slack/status");
+    if (!resp.ok) throw new Error("slack status failed");
+    const data = await resp.json();
+    isSlackConnected = !!data.connected;
+    if (slackStatusEl) {
+      if (isSlackConnected) {
+        const team = data.team_name ? ` (${data.team_name})` : "";
+        slackStatusEl.textContent = `Slack: connected${team}`;
+      } else {
+        slackStatusEl.textContent = "Slack: not connected";
+      }
+    }
+  } catch (err) {
+    isSlackConnected = false;
+    if (slackStatusEl) slackStatusEl.textContent = "Slack: status unavailable";
   }
 }
 
@@ -88,6 +120,7 @@ async function refreshAuth() {
     authUserEl.textContent = "Not signed in";
     setStatus("Sign in required");
   }
+  await refreshSlackStatus();
   setAuthUi();
 }
 
@@ -422,5 +455,22 @@ logoutBtn.addEventListener("click", async () => {
   }
   await refreshAuth();
 });
+
+if (slackConnectBtn) {
+  slackConnectBtn.addEventListener("click", () => {
+    window.location.href = "/auth/slack/login";
+  });
+}
+
+if (slackDisconnectBtn) {
+  slackDisconnectBtn.addEventListener("click", async () => {
+    try {
+      await fetch("/auth/slack/disconnect", { method: "POST" });
+    } catch (err) {
+      // no-op: refresh handles UI state
+    }
+    await refreshAuth();
+  });
+}
 
 refreshAuth();

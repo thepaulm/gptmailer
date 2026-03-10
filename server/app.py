@@ -39,6 +39,16 @@ AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true").lower() != "false"
 ALLOWED_GOOGLE_EMAIL = (os.getenv("ALLOWED_GOOGLE_EMAIL") or "").strip().lower()
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
+SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET")
+SLACK_REDIRECT_URI = os.getenv("SLACK_REDIRECT_URI")
+SLACK_USER_SCOPES = os.getenv(
+    "SLACK_USER_SCOPES",
+    "users:read,im:history,im:write,chat:write,channels:history,groups:history,mpim:history,channels:read,groups:read,mpim:read",
+)
+SLACK_TOKEN_STORE_PATH = Path(
+    os.getenv("SLACK_TOKEN_STORE_PATH", str(Path(__file__).parent / "slack_user_tokens.json"))
+)
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
@@ -48,6 +58,7 @@ if not (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and SES_FROM_EMAIL and DEFAU
 client = OpenAI()
 logger = logging.getLogger(__name__)
 sessions: dict[str, dict] = {}
+slack_user_tokens: dict[str, dict] = {}
 
 ses = boto3.client(
     "ses",
@@ -94,9 +105,78 @@ CHAT_SYSTEM_PROMPT = (
 )
 
 LAST_MESSAGE_CMD_RE = re.compile(
-    r"(?:last|latest)\s+(?:a\s+)?(?:slack\s+)?message\s+from\s+(<@([A-Z0-9]+)>|[a-zA-Z0-9._-]+)",
+    r"(?:last|latest)\s+(?:a\s+)?(?:slack\s+)?message\s+from\s+(<@([A-Z0-9]+)>|[^:]+?)\s*$",
     re.IGNORECASE,
 )
+SLACK_INBOX_CMD_RE = re.compile(
+    r"(?:latest|recent)\s+(?:slack\s+)?(?:dm|dms|messages?)\s+(?:to|for)\s+me|(?:read|check)\s+(?:my\s+)?slack",
+    re.IGNORECASE,
+)
+SLACK_REPLY_CMD_RE = re.compile(
+    r"^(?:(?:reply|respond)\s+to|(?:send(?:\s+a)?\s+slack\s+message\s+to)|(?:send\s+message\s+to))\s+(<@([A-Z0-9]+)>|[^:]+?)\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+SLACK_SEND_CONFIRM_RE = re.compile(
+    r"^(?:send(?:\s+it|\s+that|\s+now)?|confirm(?:\s+send)?|yes,\s*send|yes\s+send)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+SLACK_SEND_CANCEL_RE = re.compile(
+    r"^(?:cancel|don't\s+send|do\s+not\s+send|never\s+mind)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _load_slack_user_tokens() -> dict[str, dict]:
+    if not SLACK_TOKEN_STORE_PATH.exists():
+        return {}
+    try:
+        return json.loads(SLACK_TOKEN_STORE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Failed to load Slack token store")
+        return {}
+
+
+def _save_slack_user_tokens() -> None:
+    tmp_path = SLACK_TOKEN_STORE_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(slack_user_tokens, indent=2), encoding="utf-8")
+    tmp_path.replace(SLACK_TOKEN_STORE_PATH)
+
+
+def _session_user_key(session: dict) -> str | None:
+    sub = (session.get("sub") or "").strip()
+    if sub:
+        return f"sub:{sub}"
+    email = (session.get("email") or "").strip().lower()
+    if email:
+        return f"email:{email}"
+    return None
+
+
+def _get_slack_user_record(session: dict) -> dict | None:
+    key = _session_user_key(session)
+    if not key:
+        return None
+    return slack_user_tokens.get(key)
+
+
+def _set_slack_user_record(session: dict, record: dict) -> None:
+    key = _session_user_key(session)
+    if not key:
+        raise RuntimeError("Cannot map Slack token: missing session identity")
+    slack_user_tokens[key] = record
+    _save_slack_user_tokens()
+
+
+def _delete_slack_user_record(session: dict) -> None:
+    key = _session_user_key(session)
+    if not key:
+        return
+    if key in slack_user_tokens:
+        slack_user_tokens.pop(key, None)
+        _save_slack_user_tokens()
+
+
+slack_user_tokens = _load_slack_user_tokens()
 
 
 def _json_post(url: str, form_data: dict) -> dict:
@@ -178,15 +258,16 @@ def _verify_slack_signature(request: FastAPIRequest, raw_body: bytes) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def _slack_api_call(method: str, payload: dict | None = None) -> dict:
-    if not SLACK_BOT_TOKEN:
-        raise RuntimeError("Missing SLACK_BOT_TOKEN")
+def _slack_api_call(method: str, payload: dict | None = None, token: str | None = None) -> dict:
+    effective_token = token or SLACK_BOT_TOKEN
+    if not effective_token:
+        raise RuntimeError("Missing Slack token")
 
     req = Request(
         f"https://slack.com/api/{method}",
         data=json.dumps(payload or {}).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            "Authorization": f"Bearer {effective_token}",
             "Content-Type": "application/json; charset=utf-8",
         },
         method="POST",
@@ -198,11 +279,13 @@ def _slack_api_call(method: str, payload: dict | None = None) -> dict:
     return result
 
 
-def _slack_post_message(channel: str, text: str, thread_ts: str | None = None) -> None:
+def _slack_post_message(
+    channel: str, text: str, thread_ts: str | None = None, token: str | None = None
+) -> None:
     payload = {"channel": channel, "text": text}
     if thread_ts:
         payload["thread_ts"] = thread_ts
-    _slack_api_call("chat.postMessage", payload)
+    _slack_api_call("chat.postMessage", payload, token=token)
 
 
 def _extract_target_user_id(command_text: str) -> str | None:
@@ -214,7 +297,7 @@ def _extract_target_user_id(command_text: str) -> str | None:
     return None
 
 
-def _resolve_user_id_from_name(name: str) -> str | None:
+def _resolve_user_id_from_name(name: str, token: str | None = None) -> str | None:
     normalized = (name or "").strip().lower().lstrip("@").rstrip(".,!?")
     if not normalized:
         return None
@@ -224,7 +307,7 @@ def _resolve_user_id_from_name(name: str) -> str | None:
         payload = {"limit": 200}
         if cursor:
             payload["cursor"] = cursor
-        data = _slack_api_call("users.list", payload)
+        data = _slack_api_call("users.list", payload, token=token)
         for member in data.get("members", []):
             profile = member.get("profile", {})
             if member.get("deleted") or member.get("is_bot"):
@@ -246,7 +329,7 @@ def _resolve_user_id_from_name(name: str) -> str | None:
     return None
 
 
-def _parse_last_message_target_user_id(command_text: str) -> str | None:
+def _parse_last_message_target_user_id(command_text: str, token: str | None = None) -> str | None:
     mention_id = _extract_target_user_id(command_text)
     if mention_id:
         return mention_id
@@ -258,16 +341,19 @@ def _parse_last_message_target_user_id(command_text: str) -> str | None:
         return match.group(2)
 
     raw_name = match.group(1) or ""
-    return _resolve_user_id_from_name(raw_name)
+    try:
+        return _resolve_user_id_from_name(raw_name, token=token)
+    except Exception:
+        return None
 
 
-def _get_last_message_from_user(channel: str, user_id: str) -> dict | None:
+def _get_last_message_from_user(channel: str, user_id: str, token: str | None = None) -> dict | None:
     cursor = None
     for _ in range(20):
         payload = {"channel": channel, "limit": 200, "inclusive": True}
         if cursor:
             payload["cursor"] = cursor
-        data = _slack_api_call("conversations.history", payload)
+        data = _slack_api_call("conversations.history", payload, token=token)
         messages = data.get("messages", [])
         for msg in messages:
             if msg.get("user") != user_id:
@@ -284,12 +370,14 @@ def _get_last_message_from_user(channel: str, user_id: str) -> dict | None:
     return None
 
 
-def _get_last_dm_message_from_user(user_id: str) -> tuple[dict | None, str | None]:
-    open_data = _slack_api_call("conversations.open", {"users": user_id})
+def _get_last_dm_message_from_user(
+    user_id: str, token: str | None = None
+) -> tuple[dict | None, str | None]:
+    open_data = _slack_api_call("conversations.open", {"users": user_id}, token=token)
     channel = (open_data.get("channel") or {}).get("id")
     if not channel:
         return None, None
-    return _get_last_message_from_user(channel, user_id), channel
+    return _get_last_message_from_user(channel, user_id, token=token), channel
 
 
 def _strip_bot_mention(text: str, bot_user_id: str | None) -> str:
@@ -297,6 +385,133 @@ def _strip_bot_mention(text: str, bot_user_id: str | None) -> str:
     if bot_user_id:
         cleaned = cleaned.replace(f"<@{bot_user_id}>", "").strip()
     return cleaned
+
+
+def _require_slack_oauth_config() -> None:
+    if not (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET and SLACK_REDIRECT_URI):
+        raise HTTPException(status_code=500, detail="Slack OAuth is not configured")
+
+
+def _slack_user_token(session: dict) -> str | None:
+    record = _get_slack_user_record(session) or {}
+    token = (record.get("access_token") or "").strip()
+    if not token:
+        return None
+    return token
+
+
+def _slack_user_display_name(user_id: str, token: str, cache: dict[str, str]) -> str:
+    if user_id in cache:
+        return cache[user_id]
+    try:
+        data = _slack_api_call("users.info", {"user": user_id}, token=token)
+        user = data.get("user") or {}
+        profile = user.get("profile") or {}
+        display = (
+            profile.get("display_name")
+            or profile.get("real_name")
+            or user.get("real_name")
+            or user.get("name")
+            or user_id
+        )
+    except Exception:
+        display = user_id
+    cache[user_id] = display
+    return display
+
+
+def _clean_requested_name(raw_name: str) -> str:
+    return (raw_name or "").strip().lstrip("@").rstrip(".,!?")
+
+
+def _slack_latest_incoming_dms(token: str, self_user_id: str, limit: int = 5) -> list[dict]:
+    channels: list[dict] = []
+    cursor = None
+    for _ in range(5):
+        payload = {"types": "im", "exclude_archived": True, "limit": 200}
+        if cursor:
+            payload["cursor"] = cursor
+        data = _slack_api_call("users.conversations", payload, token=token)
+        channels.extend(data.get("channels", []))
+        cursor = (data.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            break
+
+    incoming: list[dict] = []
+    for channel in channels:
+        channel_id = channel.get("id")
+        if not channel_id:
+            continue
+        history = _slack_api_call(
+            "conversations.history",
+            {"channel": channel_id, "limit": 20, "inclusive": True},
+            token=token,
+        )
+        for msg in history.get("messages", []):
+            sender = msg.get("user")
+            if not sender or sender == self_user_id:
+                continue
+            if msg.get("subtype") == "bot_message":
+                continue
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            ts = msg.get("ts") or "0"
+            try:
+                sort_ts = float(ts)
+            except Exception:
+                sort_ts = 0.0
+            incoming.append(
+                {
+                    "channel": channel_id,
+                    "user": sender,
+                    "text": text,
+                    "ts": ts,
+                    "sort_ts": sort_ts,
+                }
+            )
+            break
+
+    incoming.sort(key=lambda m: m["sort_ts"], reverse=True)
+    return incoming[:limit]
+
+
+def _slack_try_get_permalink(
+    channel: str | None, message_ts: str | None, token: str | None = None
+) -> str | None:
+    if not channel or not message_ts:
+        return None
+    try:
+        data = _slack_api_call(
+            "chat.getPermalink",
+            {"channel": channel, "message_ts": message_ts},
+            token=token,
+        )
+        return data.get("permalink")
+    except Exception as exc:
+        logger.warning("Slack permalink unavailable channel=%s ts=%s error=%s", channel, message_ts, exc)
+        return None
+
+
+def _slack_message_exists(channel: str, message_ts: str, token: str) -> bool:
+    try:
+        data = _slack_api_call(
+            "conversations.history",
+            {"channel": channel, "latest": message_ts, "inclusive": True, "limit": 5},
+            token=token,
+        )
+        for msg in data.get("messages", []):
+            if (msg.get("ts") or "") == message_ts:
+                return True
+        return False
+    except Exception as exc:
+        logger.warning(
+            "Slack post-send verification failed channel=%s ts=%s error=%s",
+            channel,
+            message_ts,
+            exc,
+        )
+        return False
 
 
 def _generate_text(messages: list, model: str = "gpt-4o-mini") -> str:
@@ -411,6 +626,7 @@ def auth_me(request: FastAPIRequest):
     session = _session_from_request(request)
     if not session:
         return JSONResponse({"authenticated": False})
+    slack_record = _get_slack_user_record(session) or {}
     return JSONResponse(
         {
             "authenticated": True,
@@ -419,6 +635,11 @@ def auth_me(request: FastAPIRequest):
                 "email": session.get("email"),
                 "name": session.get("name"),
                 "picture": session.get("picture"),
+            },
+            "slack": {
+                "connected": bool(slack_record.get("access_token")),
+                "user_id": slack_record.get("slack_user_id"),
+                "team_name": slack_record.get("team_name"),
             },
         }
     )
@@ -432,6 +653,100 @@ def auth_logout(request: FastAPIRequest):
     response = JSONResponse({"ok": True})
     response.delete_cookie(SESSION_COOKIE_NAME)
     return response
+
+
+@app.get("/auth/slack/login")
+def auth_slack_login(request: FastAPIRequest):
+    _require_slack_oauth_config()
+    session = _require_auth(request)
+    state = secrets.token_urlsafe(24)
+    session["slack_oauth_state"] = state
+    params = urlencode(
+        {
+            "client_id": SLACK_CLIENT_ID,
+            "redirect_uri": SLACK_REDIRECT_URI,
+            "response_type": "code",
+            "user_scope": SLACK_USER_SCOPES,
+            "state": state,
+        }
+    )
+    return RedirectResponse(url=f"https://slack.com/oauth/v2/authorize?{params}", status_code=302)
+
+
+@app.get("/auth/slack/callback")
+def auth_slack_callback(
+    request: FastAPIRequest,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    _require_slack_oauth_config()
+    session = _require_auth(request)
+
+    if error:
+        raise HTTPException(status_code=400, detail=f"Slack OAuth failed: {error}")
+
+    expected_state = session.get("slack_oauth_state")
+    if not code or not state or not expected_state or state != expected_state:
+        raise HTTPException(status_code=400, detail="Invalid Slack OAuth state")
+
+    try:
+        token_data = _json_post(
+            "https://slack.com/api/oauth.v2.access",
+            {
+                "client_id": SLACK_CLIENT_ID,
+                "client_secret": SLACK_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": SLACK_REDIRECT_URI,
+            },
+        )
+        if not token_data.get("ok"):
+            raise RuntimeError(token_data.get("error") or "Slack token exchange failed")
+        authed_user = token_data.get("authed_user") or {}
+        access_token = (authed_user.get("access_token") or "").strip()
+        if not access_token:
+            raise RuntimeError("No Slack user access token returned")
+
+        _set_slack_user_record(
+            session,
+            {
+                "access_token": access_token,
+                "slack_user_id": authed_user.get("id"),
+                "scope": authed_user.get("scope"),
+                "team_id": (token_data.get("team") or {}).get("id"),
+                "team_name": (token_data.get("team") or {}).get("name"),
+                "updated_at": int(time.time()),
+            },
+        )
+    except Exception as exc:
+        logger.exception("Slack OAuth callback failed")
+        raise HTTPException(status_code=400, detail=f"Slack OAuth exchange failed: {exc}") from exc
+    finally:
+        session.pop("slack_oauth_state", None)
+
+    return RedirectResponse(url="/", status_code=302)
+
+
+@app.get("/auth/slack/status")
+def auth_slack_status(request: FastAPIRequest):
+    session = _require_auth(request)
+    record = _get_slack_user_record(session) or {}
+    return JSONResponse(
+        {
+            "connected": bool(record.get("access_token")),
+            "user_id": record.get("slack_user_id"),
+            "team_name": record.get("team_name"),
+            "scope": record.get("scope"),
+        }
+    )
+
+
+@app.post("/auth/slack/disconnect")
+def auth_slack_disconnect(request: FastAPIRequest):
+    session = _require_auth(request)
+    _delete_slack_user_record(session)
+    session.pop("pending_slack_send", None)
+    return JSONResponse({"ok": True})
 
 
 @app.get("/slack/events")
@@ -512,14 +827,7 @@ async def slack_events(request: FastAPIRequest):
                 return JSONResponse({"ok": True})
 
             msg_text = (message.get("text") or "").strip()
-            msg_ts = message.get("ts")
-            permalink = None
-            if msg_ts:
-                permalink_data = _slack_api_call(
-                    "chat.getPermalink",
-                    {"channel": channel, "message_ts": msg_ts},
-                )
-                permalink = permalink_data.get("permalink")
+            permalink = _slack_try_get_permalink(channel, message.get("ts"))
 
             reply = f"Last message from <@{target_user_id}>:\n>{msg_text}"
             if permalink:
@@ -632,7 +940,7 @@ async def summarize_email(request: FastAPIRequest, payload: dict):
 
 @app.post("/chat")
 async def chat(request: FastAPIRequest, payload: dict):
-    _require_auth(request)
+    session = _require_auth(request)
     message = payload.get("message")
     history = payload.get("history", [])
 
@@ -641,14 +949,66 @@ async def chat(request: FastAPIRequest, payload: dict):
     if not isinstance(history, list):
         raise HTTPException(status_code=400, detail="History must be a list")
 
-    direct_command_user_id = _parse_last_message_target_user_id(message.strip())
+    user_message = message.strip()
+    lowered = user_message.lower()
+    slack_token = _slack_user_token(session)
+    connect_hint = "Connect Slack first at /auth/slack/login."
+
+    if lowered in {"connect slack", "link slack", "authorize slack"}:
+        if not (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET and SLACK_REDIRECT_URI):
+            return JSONResponse({"reply": "Slack OAuth is not configured on this server."})
+        return JSONResponse({"reply": "Use this link to connect Slack: /auth/slack/login"})
+
+    pending_send = session.get("pending_slack_send")
+    if pending_send and isinstance(pending_send, dict):
+        if SLACK_SEND_CANCEL_RE.match(user_message):
+            session.pop("pending_slack_send", None)
+            return JSONResponse({"reply": "Canceled. I did not send the Slack message."})
+        if SLACK_SEND_CONFIRM_RE.match(user_message):
+            if not slack_token:
+                return JSONResponse({"reply": f"{connect_hint} Your pending draft was kept."})
+            try:
+                channel = pending_send.get("channel")
+                text = pending_send.get("text")
+                target_user = pending_send.get("target_user_id")
+                target_label = (pending_send.get("target_user_label") or "").strip()
+                if not channel or not text:
+                    session.pop("pending_slack_send", None)
+                    return JSONResponse({"reply": "Pending Slack draft was invalid and has been cleared."})
+                sent = _slack_api_call(
+                    "chat.postMessage",
+                    {"channel": channel, "text": text},
+                    token=slack_token,
+                )
+                session.pop("pending_slack_send", None)
+                sent_ts = (sent.get("ts") or "").strip()
+                permalink = _slack_try_get_permalink(channel, sent_ts, slack_token)
+                exists = _slack_message_exists(channel, sent_ts, slack_token) if sent_ts else False
+                target_display = target_label or "that user"
+                reply = f"Sent as you to {target_display}:\n{text}"
+                if permalink:
+                    reply += f"\n{permalink}"
+                if sent_ts:
+                    reply += f"\n(channel `{channel}`, ts `{sent_ts}`)"
+                if not exists:
+                    reply += "\nWarning: Slack accepted the post, but I could not verify it in recent history."
+                return JSONResponse({"reply": reply})
+            except Exception as exc:
+                logger.exception("Slack send-as-user failed")
+                return JSONResponse({"reply": f"Failed to send Slack message: {exc}"})
+
+    target_match = LAST_MESSAGE_CMD_RE.search(user_message)
+    requested_target_raw = ""
+    if target_match:
+        requested_target_raw = (target_match.group(1) or "").strip()
+    direct_command_user_id = _parse_last_message_target_user_id(user_message, token=slack_token)
     if direct_command_user_id:
-        if not SLACK_BOT_TOKEN:
-            return JSONResponse(
-                {"reply": "Slack is not configured on this server (missing SLACK_BOT_TOKEN)."}
-            )
+        if not slack_token:
+            return JSONResponse({"reply": connect_hint})
         try:
-            dm_message, dm_channel = _get_last_dm_message_from_user(direct_command_user_id)
+            dm_message, dm_channel = _get_last_dm_message_from_user(
+                direct_command_user_id, token=slack_token
+            )
             if not dm_message or not dm_channel:
                 return JSONResponse(
                     {
@@ -657,22 +1017,95 @@ async def chat(request: FastAPIRequest, payload: dict):
                 )
 
             msg_text = (dm_message.get("text") or "").strip()
-            msg_ts = dm_message.get("ts")
-            permalink = None
-            if msg_ts:
-                permalink_data = _slack_api_call(
-                    "chat.getPermalink",
-                    {"channel": dm_channel, "message_ts": msg_ts},
-                )
-                permalink = permalink_data.get("permalink")
+            permalink = _slack_try_get_permalink(dm_channel, dm_message.get("ts"), slack_token)
 
-            reply = f"Last Slack message from <@{direct_command_user_id}>:\n{msg_text}"
+            sender_name = _slack_user_display_name(direct_command_user_id, slack_token, {})
+            if sender_name == direct_command_user_id and requested_target_raw:
+                fallback_name = _clean_requested_name(requested_target_raw)
+                if not fallback_name.startswith("<@"):
+                    sender_name = fallback_name
+            sender_label = sender_name
+            reply = f"Last Slack message from {sender_label}:\n{msg_text}"
             if permalink:
                 reply += f"\n{permalink}"
             return JSONResponse({"reply": reply})
         except Exception as exc:
             logger.exception("Slack lookup from /chat failed")
             return JSONResponse({"reply": f"Slack lookup failed: {exc}"})
+
+    if SLACK_INBOX_CMD_RE.search(user_message):
+        if not slack_token:
+            return JSONResponse({"reply": connect_hint})
+        try:
+            auth_data = _slack_api_call("auth.test", {}, token=slack_token)
+            self_user_id = auth_data.get("user_id")
+            if not self_user_id:
+                return JSONResponse({"reply": "Slack auth test did not return your user id."})
+
+            latest = _slack_latest_incoming_dms(slack_token, self_user_id, limit=5)
+            if not latest:
+                return JSONResponse({"reply": "I couldn't find any recent incoming Slack DMs."})
+
+            name_cache: dict[str, str] = {}
+            lines = []
+            for item in latest:
+                sender_id = item.get("user") or ""
+                sender_name = _slack_user_display_name(sender_id, slack_token, name_cache)
+                snippet = (item.get("text") or "").replace("\n", " ").strip()
+                if len(snippet) > 200:
+                    snippet = f"{snippet[:200]}..."
+                lines.append(f"- {sender_name}: {snippet}")
+            return JSONResponse(
+                {
+                    "reply": "Latest Slack messages sent directly to you:\n"
+                    + "\n".join(lines)
+                    + "\n\nTell me what to send with: `reply to @name: your message`.",
+                }
+            )
+        except Exception as exc:
+            logger.exception("Slack inbox lookup failed")
+            return JSONResponse({"reply": f"Slack inbox lookup failed: {exc}"})
+
+    reply_match = SLACK_REPLY_CMD_RE.match(user_message)
+    if reply_match:
+        if not slack_token:
+            return JSONResponse({"reply": connect_hint})
+        target_user_id = reply_match.group(2)
+        target_name = (reply_match.group(1) or "").strip()
+        draft_text = (reply_match.group(3) or "").strip()
+        if not draft_text:
+            return JSONResponse({"reply": "Please include a reply message after the colon."})
+        try:
+            if not target_user_id:
+                target_user_id = _resolve_user_id_from_name(target_name, token=slack_token)
+            if not target_user_id:
+                return JSONResponse({"reply": f"I couldn't find Slack user `{target_name}`."})
+            resolved_name = _slack_user_display_name(target_user_id, slack_token, {})
+            if resolved_name == target_user_id:
+                resolved_name = _clean_requested_name(target_name)
+            target_label = resolved_name or "that user"
+            open_data = _slack_api_call("conversations.open", {"users": target_user_id}, token=slack_token)
+            channel = (open_data.get("channel") or {}).get("id")
+            if not channel:
+                return JSONResponse({"reply": "I couldn't open a DM channel for that user."})
+            session["pending_slack_send"] = {
+                "target_user_id": target_user_id,
+                "target_user_label": target_label,
+                "channel": channel,
+                "text": draft_text,
+                "created_at": int(time.time()),
+            }
+            return JSONResponse(
+                {
+                    "reply": (
+                        f"Draft ready to send as you to {target_label}:\n"
+                        f"{draft_text}\n\nSay `send it` to confirm or `cancel`."
+                    )
+                }
+            )
+        except Exception as exc:
+            logger.exception("Slack reply draft failed")
+            return JSONResponse({"reply": f"Couldn't prepare Slack reply: {exc}"})
 
     input_messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
     for item in history:
@@ -685,7 +1118,7 @@ async def chat(request: FastAPIRequest, payload: dict):
             input_messages.append(
                 {"role": item["role"], "content": item["content"].strip()}
             )
-    input_messages.append({"role": "user", "content": message.strip()})
+    input_messages.append({"role": "user", "content": user_message})
 
     reply = _generate_text(input_messages, model="gpt-4o-mini")
     if not reply:

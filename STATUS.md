@@ -1,14 +1,14 @@
 # Project Status
 
 ## Session Handoff (Read First)
-- Date: 2026-03-08
+- Date: 2026-03-10
 - State: working
 - Current blocker: none.
-- Last verified behavior: launch script starts server and prints URL by default (`--open` opens browser), speech defaults are `sage` + `1.3x`, empty transcript no longer shows as 500, and user reports HTTPS is working at the EC2 domain.
-- Next step (single action): Implement Slack user OAuth flow so the app can use the signed-in user's token (not bot token) to read personal history and send replies as that user.
-- Next command to run: inspect current Slack app scopes/settings and design OAuth callback storage path in backend.
-- Expected result: authenticated user token is available server-side for `/chat` Slack intents; app can read that user's own DM/channel history and prepare/send replies with explicit confirmation.
-- If fails, do this: verify Slack user scopes are requested, reinstall app, confirm token persistence, and check backend logs for OAuth/token errors.
+- Last verified behavior: Slack user OAuth endpoints are live; the web UI can connect/disconnect Slack; `/chat` can read latest incoming DMs, resolve friendly names, and draft + explicitly confirm send-as-user replies.
+- Next step (single action): Verify Slack app user scopes/redirect URI and run end-to-end test (connect, read, draft, confirm send) on target deployment.
+- Next command to run: start app, connect Slack, ask `latest slack messages to me`, then `send slack message to <name>: ...`, then `send it.`.
+- Expected result: authenticated user token is available server-side and used for `/chat` Slack intents (read personal DMs + send replies as user after explicit confirmation, including punctuation-tolerant confirm commands).
+- If fails, do this: verify Slack user scopes are requested, reinstall app, confirm token persistence file path/permissions, and check backend logs for OAuth/token errors.
 
 ## Goal
 Build a fully voice-enabled web app that transcribes speech, summarizes the conversation into bullet points, and emails the summary via AWS SES when the user says “email me a summary.”
@@ -30,6 +30,7 @@ Build a fully voice-enabled web app that transcribes speech, summarizes the conv
 - SES is still in **sandbox**; recipients must be verified.
 - Verified sender email is configured in `server/.env`.
 - Credential source is IAM user static access keys in `server/.env`.
+- Slack user OAuth (per-user token flow) is now implemented for read/send-as-user behavior in `/chat`.
 
 ## Files Added
 - `server/app.py`: FastAPI backend with `/transcribe`, `/chat`, `/speak`, and `/summarize_email` endpoints
@@ -53,6 +54,11 @@ Fill `server/.env` with:
 - `DEFAULT_TO_EMAIL` (verified recipient email while SES is in sandbox; any domain is allowed)
 - `SLACK_BOT_TOKEN` (for `chat.postMessage`)
 - `SLACK_SIGNING_SECRET` (for Slack request verification)
+- `SLACK_CLIENT_ID`
+- `SLACK_CLIENT_SECRET`
+- `SLACK_REDIRECT_URI`
+- `SLACK_USER_SCOPES` (user-token scopes for read/send flows)
+- `SLACK_TOKEN_STORE_PATH` (local token persistence path)
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
 - `GOOGLE_REDIRECT_URI`
@@ -111,17 +117,37 @@ Note: Treat `server/.env` as the source of truth for environment values. If it c
   - Prompts like `last message from Alex` / `last a slack message from Alex` are intercepted.
   - Backend resolves Slack user, opens DM conversation, fetches latest message from that person, and returns it in chat reply.
 - Confirmed product direction: support reading user's personal Slack history and replying as the user (requires user OAuth tokens and explicit send confirmation flow).
+- Implemented Slack user OAuth endpoints:
+  - `GET /auth/slack/login`
+  - `GET /auth/slack/callback`
+  - `GET /auth/slack/status`
+  - `POST /auth/slack/disconnect`
+- Added per-user Slack token persistence in local JSON store (`SLACK_TOKEN_STORE_PATH`).
+- Updated web auth header with Slack connect/disconnect controls and connection status.
+- Updated `/chat` Slack intents to use signed-in user token:
+  - Read latest incoming DMs with prompts like `latest slack messages to me`.
+  - Prepare send-as-user draft with `reply to @name: ...`.
+  - Require explicit confirmation (`send it`) before sending.
+  - Support `cancel` to discard pending draft.
+- Expanded Slack send draft command parsing:
+  - `send slack message to <name>: ...`
+  - `send message to <name>: ...`
+  - names with spaces are supported.
+- Fixed Slack send confirmation parsing to accept natural punctuation (`send it.`, `send it!`, `cancel.`).
+- Fixed false email-summary trigger on `send it` so Slack confirmation reaches `/chat`.
+- Made Slack permalink generation best-effort so read/send actions do not fail when `chat.getPermalink` returns `invalid_arguments`.
+- Added post-send verification by reading message `ts` from channel history and reporting channel/ts in confirmation text.
+- Updated Slack response formatting to prefer friendly names and avoid raw Slack IDs in user-facing messages.
 
 ## Next Steps
-1. Implement Slack user OAuth install/login flow and callback handling in backend.
-2. Store per-user Slack tokens securely and map them to authenticated web sessions.
-3. Update `/chat` Slack lookup intent to use the signed-in user's token (personal history access).
-4. Add "send as me" action with explicit confirmation before sending.
-5. End-to-end test user-token flow (read + draft + confirm send) and verify permissions/scopes.
-6. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
-7. Add voice command phrases to end chat session (for example: “end chat”, “stop chat”, “we’re done”).
-8. Add optional voice command phrases to start a new chat/reset conversation context (for example: “new chat”, “start over”).
-9. Optional hygiene: add `server/.env` to `.gitignore` to avoid accidental secret commits.
+1. Verify Slack app user scopes/redirect URI and reinstall the app if scopes changed.
+2. End-to-end test user-token flow (connect + read + draft + confirm send) on local and EC2.
+3. Decide whether to encrypt local token store immediately or move to managed secret/data store.
+4. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
+5. Add a dedicated UI confirmation button for Slack sends (optional) to reduce reliance on phrase matching.
+6. Add voice command phrases to end chat session (for example: “end chat”, “stop chat”, “we’re done”).
+7. Add optional voice command phrases to start a new chat/reset conversation context (for example: “new chat”, “start over”).
+8. Optional hygiene: add `server/.env` and token store path to `.gitignore` to avoid accidental secret commits.
 
 ## Testing URL Reminder
 - Prefer the backend-served URL `http://localhost:8000` for local testing.

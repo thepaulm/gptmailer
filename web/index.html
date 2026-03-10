@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Voice Summary Mailer</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260308-2" />
+    <link rel="stylesheet" href="/static/style.css?v=20260310-1" />
   </head>
   <body>
     <main class="wrap">
@@ -15,6 +15,9 @@
           <span id="authUser">Not signed in</span>
           <button id="loginBtn" type="button">Sign in with Google</button>
           <button id="logoutBtn" type="button" hidden>Sign out</button>
+          <span id="slackStatus">Slack: not connected</span>
+          <button id="slackConnectBtn" type="button" hidden>Connect Slack</button>
+          <button id="slackDisconnectBtn" type="button" hidden>Disconnect Slack</button>
         </div>
       </header>
 
@@ -59,6 +62,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260308-2"></script>
+    <script src="/static/app.js?v=20260310-1"></script>
   </body>
 </html>

@@ -76,8 +76,12 @@ If both `SSL_CERTFILE` and `SSL_KEYFILE` are set, it starts uvicorn with HTTPS.
 - Browser mic requires HTTPS on mobile. `http://localhost` works for local testing.
 - Click `Start Recording` once to begin a continuous chat session; use `End Chat` to stop.
 - The app auto-submits a turn after a brief pause in speech.
-- Email summary trigger supports natural phrasing (for example: `email this`, `send this by email`, `mail me the recap`, `send me the notes`).
+- `/chat` now acts as the single action router for normal replies, Slack actions, and email-summary requests.
+- The frontend no longer intercepts email-summary phrases; all user messages go to `/chat`, where the model returns a structured action plan that Python validates and executes.
+- Email summary requests support natural phrasing (for example: `email this`, `send this by email`, `mail me the recap`, `send me the notes`).
 - To send to another recipient, say the full email address in the same utterance.
+- Side-effecting actions are staged first and require explicit confirmation before Python sends Slack messages or summary emails.
+- Next validation step: test this new `/chat` action architecture end to end for both staged email summary and staged Slack send.
 - After a successful send, the app posts and can speak a confirmation message (`I emailed your summary to ...`).
 - Reply speech speed is adjustable from the UI (`1.0x`, `1.15x`, `1.25x`, `1.3x`, `1.35x`, `1.4x`).
 - Default reply voice is `sage` and default speech speed is `1.3x`.
@@ -95,6 +99,7 @@ If both `SSL_CERTFILE` and `SSL_KEYFILE` are set, it starts uvicorn with HTTPS.
 - Confirm with `send it` (also accepts `send it.` / `send it!`) or cancel with `cancel`.
 - Messages are sent with your Slack user token, not a bot token.
 - User-facing responses prefer friendly names (not raw Slack user IDs).
+- Slack routing is model-directed through `/chat`; Python still resolves users, stages drafts, and enforces confirmation before sending.
 - Permalink lookup is best-effort; message reads/sends continue even if Slack permalink generation fails.
 
 ## Deployment Note (Slack Events)

@@ -36,21 +36,6 @@ let isSlackConnected = false;
 const SILENCE_TIMEOUT_MS = 1600;
 const VOICE_THRESHOLD = 0.02;
 
-const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
-const EMAIL_WORD_RE = /\b(e-?mail|mail)\b/i;
-const EMAIL_ROUTE_RE = /\b(by|via|through)\s+email\b/i;
-const SUMMARY_WORD_RE = /\b(summary|recap|notes?|bullet\s*points?|takeaways?)\b/i;
-
-function wantsSummaryEmail(text) {
-  const normalized = text.toLowerCase().trim();
-  const mentionsEmail =
-    EMAIL_WORD_RE.test(normalized) || EMAIL_ROUTE_RE.test(normalized);
-  const asksForSummary =
-    SUMMARY_WORD_RE.test(normalized) ||
-    /\b(this|that|conversation|chat)\b/i.test(normalized);
-  return mentionsEmail && asksForSummary;
-}
-
 function setStatus(text) {
   statusEl.textContent = text;
 }
@@ -136,12 +121,6 @@ function selectedSpeechRate() {
   const raw = speechRateSelect ? Number.parseFloat(speechRateSelect.value) : 1.3;
   if (!Number.isFinite(raw)) return 1.3;
   return Math.min(1.4, Math.max(0.8, raw));
-}
-
-function conversationText() {
-  return conversation
-    .map((m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`)
-    .join("\n");
 }
 
 function chatHistory() {
@@ -293,11 +272,6 @@ async function sendForTranscription(blob) {
     appendTranscript(`You: ${text}`);
     setStatus("Idle");
 
-    if (wantsSummaryEmail(text)) {
-      await sendSummaryEmail(text);
-      return;
-    }
-
     await askAssistant(text);
   } catch (err) {
     setStatus(`Error: ${err.message}`);
@@ -371,41 +345,6 @@ async function speakReply(text) {
     });
     URL.revokeObjectURL(objectUrl);
     if (activeAudio === audio) activeAudio = null;
-  } catch (err) {
-    setStatus(`Error: ${err.message}`);
-  }
-}
-
-async function sendSummaryEmail(latestText) {
-  const toMatch = latestText.match(EMAIL_RE);
-  const toEmail = toMatch ? toMatch[0] : null;
-
-  setStatus("Sending summary email...");
-
-  const payload = {
-    conversation: conversationText(),
-  };
-
-  if (toEmail) payload.to = toEmail;
-
-  try {
-    const resp = await fetch("/summarize_email", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || "Email failed");
-    }
-
-    const data = await resp.json();
-    const confirmation = `I emailed your summary to ${data.to}.`;
-    conversation.push({ role: "assistant", content: confirmation });
-    appendTranscript(`Assistant: ${confirmation}`);
-    setStatus("Idle");
-    await speakReply(confirmation);
   } catch (err) {
     setStatus(`Error: ${err.message}`);
   }

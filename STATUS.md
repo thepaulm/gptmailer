@@ -1,14 +1,14 @@
 # Project Status
 
 ## Session Handoff (Read First)
-- Date: 2026-03-10
+- Date: 2026-03-11
 - State: working
 - Current blocker: none.
-- Last verified behavior: Slack user OAuth endpoints are live; the web UI can connect/disconnect Slack; `/chat` can read latest incoming DMs, resolve friendly names, and draft + explicitly confirm send-as-user replies.
-- Next step (single action): Verify Slack app user scopes/redirect URI and run end-to-end test (connect, read, draft, confirm send) on target deployment.
-- Next command to run: start app, connect Slack, ask `latest slack messages to me`, then `send slack message to <name>: ...`, then `send it.`.
-- Expected result: authenticated user token is available server-side and used for `/chat` Slack intents (read personal DMs + send replies as user after explicit confirmation, including punctuation-tolerant confirm commands).
-- If fails, do this: verify Slack user scopes are requested, reinstall app, confirm token persistence file path/permissions, and check backend logs for OAuth/token errors.
+- Last verified behavior: `/chat` now routes normal assistant replies, Slack intents, and email-summary requests through a structured server-side action plan; the web client no longer intercepts email-summary phrases.
+- Next step (single action): Test the new structured `/chat` action architecture end to end on the target deployment.
+- Next command to run: start app, have a short conversation, ask `email me a summary`, then `send it`; then ask `latest slack messages to me`, then `send slack message to <name>: ...`, then `send it`.
+- Expected result: the model returns a structured action plan, Python stages the email/Slack action, and explicit confirmation triggers the actual send.
+- If fails, do this: inspect backend logs for structured-planning JSON errors, confirm OpenAI chat-completions JSON mode works with the installed SDK/model, and verify Slack OAuth/scopes/token persistence.
 
 ## Goal
 Build a fully voice-enabled web app that transcribes speech, summarizes the conversation into bullet points, and emails the summary via AWS SES when the user says “email me a summary.”
@@ -19,9 +19,10 @@ Build a fully voice-enabled web app that transcribes speech, summarizes the conv
 - Backend API routes now require authentication by default (configurable via `AUTH_REQUIRED`).
 - The app records audio continuously in session mode, transcribes it with OpenAI, gets ChatGPT replies, and can speak replies via OpenAI TTS.
 - Recording now auto-submits on silence after speech is detected.
-- Natural email-intent phrases now trigger SES email sending flow (not just one exact phrase).
-- Email-intent utterances are intercepted client-side and are not sent to `/chat`.
-- After a successful send, the assistant confirms in transcript and voice that the email was sent.
+- Natural email-intent phrases now route through `/chat` instead of client-side interception.
+- `/chat` now uses a structured action-planning step so Python can stage and execute Slack/email actions.
+- Email and Slack side effects now require explicit confirmation from a pending server-side action.
+- After a successful send, the assistant confirms in transcript and voice that the action completed.
 - TTS playback speed is user-selectable (`1.0x`, `1.15x`, `1.25x`, `1.3x`, `1.35x`, `1.4x`).
 - Default TTS voice is now `sage`; default playback speed is now `1.3x`.
 - `/transcribe` now accepts both `/transcribe` and `/transcribe/`.
@@ -73,6 +74,11 @@ Note: Treat `server/.env` as the source of truth for environment values. If it c
 - For send-on-behalf actions, what explicit confirmation UX is preferred in web chat (single-turn yes/no vs. separate "Send" action)?
 
 ## Completed This Session
+- Reworked `/chat` into the single server-side action router for normal replies, Slack actions, and email-summary requests.
+- Added a structured action-planning prompt in `server/app.py` so the model returns JSON describing the requested action.
+- Added server-side staging and confirmation for summary emails in `/chat`.
+- Migrated Slack send staging from `pending_slack_send` to a general `pending_action` flow, with legacy-session migration.
+- Removed client-side email phrase interception from `web/app.js`; all user utterances now go through `/chat`.
 - Added `PORT` support via `server/.env`.
 - Updated `launch_app.sh` to source `server/.env` so `PORT`/`HOST` are applied automatically.
 - Updated `launch_app.sh` so browser auto-open only happens when `--open` is passed.
@@ -140,10 +146,10 @@ Note: Treat `server/.env` as the source of truth for environment values. If it c
 - Updated Slack response formatting to prefer friendly names and avoid raw Slack IDs in user-facing messages.
 
 ## Next Steps
-1. Verify Slack app user scopes/redirect URI and reinstall the app if scopes changed.
-2. End-to-end test user-token flow (connect + read + draft + confirm send) on local and EC2.
-3. Decide whether to encrypt local token store immediately or move to managed secret/data store.
-4. Keep existing email-intent handling precedence so command phrases do not get forwarded to `/chat`.
+1. Test the new structured `/chat` action architecture end to end for both email summary and Slack flows.
+2. Verify Slack app user scopes/redirect URI and reinstall the app if scopes changed.
+3. End-to-end test user-token flow (connect + read + draft + confirm send) on local and EC2.
+4. Decide whether to encrypt local token store immediately or move to managed secret/data store.
 5. Add a dedicated UI confirmation button for Slack sends (optional) to reduce reliance on phrase matching.
 6. Add voice command phrases to end chat session (for example: “end chat”, “stop chat”, “we’re done”).
 7. Add optional voice command phrases to start a new chat/reset conversation context (for example: “new chat”, “start over”).

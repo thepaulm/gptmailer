@@ -103,6 +103,32 @@ CHAT_SYSTEM_PROMPT = (
     "You are a concise, helpful voice assistant in a web app. "
     "Provide direct answers and practical next steps when useful."
 )
+CHAT_ACTION_SYSTEM_PROMPT = """You are the action planner for a web assistant.
+
+Return exactly one JSON object and no other text. The JSON must match this shape:
+{
+  "reply": string,
+  "action": {
+    "type": "none" | "slack_connect" | "slack_read_inbox" | "slack_read_user" | "slack_send_message" | "email_summary" | "confirm_pending" | "cancel_pending",
+    "target_name": string,
+    "text": string,
+    "to": string
+  }
+}
+
+Rules:
+- Use "none" for normal conversational replies with no side effects.
+- Use "slack_connect" when the user wants Slack functionality but Slack is not connected.
+- Use "slack_read_inbox" to read the user's recent incoming Slack DMs.
+- Use "slack_read_user" to read the latest DM from one specific Slack user. Put the user in "target_name".
+- Use "slack_send_message" to prepare a Slack DM draft. Put the user in "target_name" and the message body in "text".
+- Use "email_summary" when the user wants the conversation summarized and emailed. Put the recipient in "to" if one is given.
+- Use "confirm_pending" when the user is clearly confirming a pending action.
+- Use "cancel_pending" when the user is clearly canceling a pending action.
+- Never claim an email or Slack message was already sent. Python executes actions after you return JSON.
+- If a side-effecting action needs confirmation, the reply should say it is a draft or pending confirmation.
+- If required info is missing, ask a short follow-up question and use "none".
+"""
 
 LAST_MESSAGE_CMD_RE = re.compile(
     r"(?:last|latest)\s+(?:a\s+)?(?:slack\s+)?message\s+from\s+(<@([A-Z0-9]+)>|[^:]+?)\s*$",
@@ -529,6 +555,148 @@ def _generate_text(messages: list, model: str = "gpt-4o-mini") -> str:
     return (completion.choices[0].message.content or "").strip()
 
 
+def _extract_email_address(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = EMAIL_RE.search(text)
+    if not match:
+        return None
+    return match.group(0)
+
+
+def _conversation_text_from_history(history: list[dict]) -> str:
+    lines = []
+    for item in history:
+        if (
+            isinstance(item, dict)
+            and item.get("role") in {"user", "assistant"}
+            and isinstance(item.get("content"), str)
+            and item.get("content").strip()
+        ):
+            role = "Assistant" if item["role"] == "assistant" else "User"
+            lines.append(f"{role}: {item['content'].strip()}")
+    return "\n".join(lines)
+
+
+def _pending_action_summary(pending_action: dict | None) -> dict | None:
+    if not pending_action or not isinstance(pending_action, dict):
+        return None
+    action_type = (pending_action.get("type") or "").strip()
+    if action_type == "slack_send_message":
+        return {
+            "type": action_type,
+            "target_name": pending_action.get("target_user_label") or "",
+            "text": pending_action.get("text") or "",
+        }
+    if action_type == "email_summary":
+        return {
+            "type": action_type,
+            "to": pending_action.get("to") or "",
+        }
+    return {"type": action_type}
+
+
+def _normalize_action_plan(plan: dict, user_message: str) -> dict:
+    if not isinstance(plan, dict):
+        return {"reply": "", "action": {"type": "none"}}
+
+    reply = (plan.get("reply") or "").strip()
+    raw_action = plan.get("action")
+    action = raw_action if isinstance(raw_action, dict) else {}
+    action_type = (action.get("type") or "none").strip().lower()
+    if action_type not in {
+        "none",
+        "slack_connect",
+        "slack_read_inbox",
+        "slack_read_user",
+        "slack_send_message",
+        "email_summary",
+        "confirm_pending",
+        "cancel_pending",
+    }:
+        action_type = "none"
+
+    normalized_action = {"type": action_type}
+    target_name = (action.get("target_name") or "").strip()
+    text = (action.get("text") or "").strip()
+    to_email = (action.get("to") or "").strip()
+
+    if action_type in {"slack_read_user", "slack_send_message"} and target_name:
+        normalized_action["target_name"] = target_name
+    if action_type == "slack_send_message" and text:
+        normalized_action["text"] = text
+    if action_type == "email_summary":
+        normalized_action["to"] = to_email or (_extract_email_address(user_message) or "")
+
+    return {"reply": reply, "action": normalized_action}
+
+
+def _plan_chat_action(
+    user_message: str,
+    history: list[dict],
+    slack_connected: bool,
+    pending_action: dict | None,
+) -> dict:
+    planning_payload = {
+        "message": user_message,
+        "history": [
+            {"role": item.get("role"), "content": item.get("content")}
+            for item in history
+            if isinstance(item, dict)
+            and item.get("role") in {"user", "assistant"}
+            and isinstance(item.get("content"), str)
+            and item.get("content").strip()
+        ],
+        "capabilities": {
+            "slack_connected": slack_connected,
+            "email_summary_available": True,
+        },
+        "pending_action": _pending_action_summary(pending_action),
+    }
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": CHAT_ACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(planning_payload)},
+            ],
+            response_format={"type": "json_object"},
+        )
+        content = (completion.choices[0].message.content or "").strip()
+        return _normalize_action_plan(json.loads(content), user_message)
+    except Exception:
+        logger.exception("Structured chat action planning failed")
+        return {"reply": "", "action": {"type": "none"}}
+
+
+def _send_summary_email(conversation: str, to_email: str | None) -> dict:
+    if not conversation or not isinstance(conversation, str):
+        raise HTTPException(status_code=400, detail="Missing conversation text")
+    if not isinstance(to_email, str) or not EMAIL_RE.fullmatch(to_email):
+        raise HTTPException(status_code=400, detail="Invalid recipient email")
+
+    summary = _generate_text(
+        [
+            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": conversation},
+        ],
+        model="gpt-4o-mini",
+    )
+    if not summary:
+        raise HTTPException(status_code=500, detail="Empty summary")
+
+    subject = f"Chat summary - {datetime.now(timezone.utc).date().isoformat()}"
+    ses.send_email(
+        Source=SES_FROM_EMAIL,
+        Destination={"ToAddresses": [to_email]},
+        Message={
+            "Subject": {"Data": subject},
+            "Body": {"Text": {"Data": summary}},
+        },
+    )
+    return {"ok": True, "to": to_email, "subject": subject, "summary": summary}
+
+
 @app.get("/")
 def index():
     return FileResponse(WEB_DIR / "index.html")
@@ -907,35 +1075,8 @@ async def summarize_email(request: FastAPIRequest, payload: dict):
     _require_auth(request)
     conversation = payload.get("conversation")
     to_email = payload.get("to") or DEFAULT_TO_EMAIL
-
-    if not conversation or not isinstance(conversation, str):
-        raise HTTPException(status_code=400, detail="Missing conversation text")
-
-    if not EMAIL_RE.fullmatch(to_email):
-        raise HTTPException(status_code=400, detail="Invalid recipient email")
-
-    summary = _generate_text(
-        [
-            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": conversation},
-        ],
-        model="gpt-4o-mini",
-    )
-    if not summary:
-        raise HTTPException(status_code=500, detail="Empty summary")
-
-    subject = f"Chat summary - {datetime.now(timezone.utc).date().isoformat()}"
-
-    ses.send_email(
-        Source=SES_FROM_EMAIL,
-        Destination={"ToAddresses": [to_email]},
-        Message={
-            "Subject": {"Data": subject},
-            "Body": {"Text": {"Data": summary}},
-        },
-    )
-
-    return JSONResponse({"ok": True, "to": to_email, "subject": subject})
+    result = _send_summary_email(conversation, to_email)
+    return JSONResponse({"ok": True, "to": result["to"], "subject": result["subject"]})
 
 
 @app.post("/chat")
@@ -950,37 +1091,88 @@ async def chat(request: FastAPIRequest, payload: dict):
         raise HTTPException(status_code=400, detail="History must be a list")
 
     user_message = message.strip()
-    lowered = user_message.lower()
     slack_token = _slack_user_token(session)
     connect_hint = "Connect Slack first at /auth/slack/login."
+    pending_action = session.get("pending_action")
+    if not pending_action and isinstance(session.get("pending_slack_send"), dict):
+        pending_action = session.get("pending_slack_send")
+        pending_action["type"] = "slack_send_message"
+        session["pending_action"] = pending_action
+        session.pop("pending_slack_send", None)
 
-    if lowered in {"connect slack", "link slack", "authorize slack"}:
+    plan = _plan_chat_action(
+        user_message=user_message,
+        history=history,
+        slack_connected=bool(slack_token),
+        pending_action=pending_action if isinstance(pending_action, dict) else None,
+    )
+    planned_action = plan.get("action") or {"type": "none"}
+    action_type = (planned_action.get("type") or "none").strip().lower()
+
+    if action_type == "slack_connect":
         if not (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET and SLACK_REDIRECT_URI):
-            return JSONResponse({"reply": "Slack OAuth is not configured on this server."})
-        return JSONResponse({"reply": "Use this link to connect Slack: /auth/slack/login"})
+            return JSONResponse(
+                {
+                    "reply": "Slack OAuth is not configured on this server.",
+                    "action": {"type": "slack_connect", "status": "unavailable"},
+                }
+            )
+        return JSONResponse(
+            {
+                "reply": "Use this link to connect Slack: /auth/slack/login",
+                "action": {"type": "slack_connect", "status": "ready"},
+            }
+        )
 
-    pending_send = session.get("pending_slack_send")
-    if pending_send and isinstance(pending_send, dict):
-        if SLACK_SEND_CANCEL_RE.match(user_message):
-            session.pop("pending_slack_send", None)
-            return JSONResponse({"reply": "Canceled. I did not send the Slack message."})
-        if SLACK_SEND_CONFIRM_RE.match(user_message):
+    if action_type == "cancel_pending":
+        if not isinstance(pending_action, dict):
+            return JSONResponse(
+                {"reply": "There is no pending Slack or email action to cancel.", "action": {"type": "cancel_pending"}}
+            )
+        session.pop("pending_action", None)
+        session.pop("pending_slack_send", None)
+        pending_type = (pending_action.get("type") or "").strip()
+        noun = "action"
+        if pending_type == "slack_send_message":
+            noun = "Slack draft"
+        elif pending_type == "email_summary":
+            noun = "summary email"
+        return JSONResponse(
+            {"reply": f"Canceled. I did not send the {noun}.", "action": {"type": "cancel_pending", "status": "canceled"}}
+        )
+
+    if action_type == "confirm_pending":
+        if not isinstance(pending_action, dict):
+            return JSONResponse(
+                {"reply": "There is no pending Slack or email action to confirm.", "action": {"type": "confirm_pending"}}
+            )
+        pending_type = (pending_action.get("type") or "").strip()
+        if pending_type == "slack_send_message":
             if not slack_token:
-                return JSONResponse({"reply": f"{connect_hint} Your pending draft was kept."})
+                return JSONResponse(
+                    {
+                        "reply": f"{connect_hint} Your pending draft was kept.",
+                        "action": {"type": "confirm_pending", "status": "blocked"},
+                    }
+                )
             try:
-                channel = pending_send.get("channel")
-                text = pending_send.get("text")
-                target_user = pending_send.get("target_user_id")
-                target_label = (pending_send.get("target_user_label") or "").strip()
+                channel = pending_action.get("channel")
+                text = pending_action.get("text")
+                target_label = (pending_action.get("target_user_label") or "").strip()
                 if not channel or not text:
-                    session.pop("pending_slack_send", None)
-                    return JSONResponse({"reply": "Pending Slack draft was invalid and has been cleared."})
+                    session.pop("pending_action", None)
+                    return JSONResponse(
+                        {
+                            "reply": "Pending Slack draft was invalid and has been cleared.",
+                            "action": {"type": "confirm_pending", "status": "invalid"},
+                        }
+                    )
                 sent = _slack_api_call(
                     "chat.postMessage",
                     {"channel": channel, "text": text},
                     token=slack_token,
                 )
-                session.pop("pending_slack_send", None)
+                session.pop("pending_action", None)
                 sent_ts = (sent.get("ts") or "").strip()
                 permalink = _slack_try_get_permalink(channel, sent_ts, slack_token)
                 exists = _slack_message_exists(channel, sent_ts, slack_token) if sent_ts else False
@@ -992,59 +1184,61 @@ async def chat(request: FastAPIRequest, payload: dict):
                     reply += f"\n(channel `{channel}`, ts `{sent_ts}`)"
                 if not exists:
                     reply += "\nWarning: Slack accepted the post, but I could not verify it in recent history."
-                return JSONResponse({"reply": reply})
+                return JSONResponse(
+                    {"reply": reply, "action": {"type": "slack_send_message", "status": "sent"}}
+                )
             except Exception as exc:
                 logger.exception("Slack send-as-user failed")
-                return JSONResponse({"reply": f"Failed to send Slack message: {exc}"})
-
-    target_match = LAST_MESSAGE_CMD_RE.search(user_message)
-    requested_target_raw = ""
-    if target_match:
-        requested_target_raw = (target_match.group(1) or "").strip()
-    direct_command_user_id = _parse_last_message_target_user_id(user_message, token=slack_token)
-    if direct_command_user_id:
-        if not slack_token:
-            return JSONResponse({"reply": connect_hint})
-        try:
-            dm_message, dm_channel = _get_last_dm_message_from_user(
-                direct_command_user_id, token=slack_token
-            )
-            if not dm_message or not dm_channel:
                 return JSONResponse(
                     {
-                        "reply": f"I couldn't find a recent Slack DM message from <@{direct_command_user_id}>."
+                        "reply": f"Failed to send Slack message: {exc}",
+                        "action": {"type": "slack_send_message", "status": "failed"},
+                    }
+                )
+        if pending_type == "email_summary":
+            try:
+                result = _send_summary_email(
+                    pending_action.get("conversation") or "",
+                    pending_action.get("to") or DEFAULT_TO_EMAIL,
+                )
+                session.pop("pending_action", None)
+                return JSONResponse(
+                    {
+                        "reply": f"I emailed your summary to {result['to']}.",
+                        "action": {"type": "email_summary", "status": "sent", "to": result["to"]},
+                    }
+                )
+            except Exception as exc:
+                logger.exception("Summary email send failed")
+                return JSONResponse(
+                    {
+                        "reply": f"Email send failed: {exc}",
+                        "action": {"type": "email_summary", "status": "failed"},
                     }
                 )
 
-            msg_text = (dm_message.get("text") or "").strip()
-            permalink = _slack_try_get_permalink(dm_channel, dm_message.get("ts"), slack_token)
-
-            sender_name = _slack_user_display_name(direct_command_user_id, slack_token, {})
-            if sender_name == direct_command_user_id and requested_target_raw:
-                fallback_name = _clean_requested_name(requested_target_raw)
-                if not fallback_name.startswith("<@"):
-                    sender_name = fallback_name
-            sender_label = sender_name
-            reply = f"Last Slack message from {sender_label}:\n{msg_text}"
-            if permalink:
-                reply += f"\n{permalink}"
-            return JSONResponse({"reply": reply})
-        except Exception as exc:
-            logger.exception("Slack lookup from /chat failed")
-            return JSONResponse({"reply": f"Slack lookup failed: {exc}"})
-
-    if SLACK_INBOX_CMD_RE.search(user_message):
+    if action_type == "slack_read_inbox":
         if not slack_token:
-            return JSONResponse({"reply": connect_hint})
+            return JSONResponse({"reply": connect_hint, "action": {"type": "slack_read_inbox", "status": "blocked"}})
         try:
             auth_data = _slack_api_call("auth.test", {}, token=slack_token)
             self_user_id = auth_data.get("user_id")
             if not self_user_id:
-                return JSONResponse({"reply": "Slack auth test did not return your user id."})
+                return JSONResponse(
+                    {
+                        "reply": "Slack auth test did not return your user id.",
+                        "action": {"type": "slack_read_inbox", "status": "failed"},
+                    }
+                )
 
             latest = _slack_latest_incoming_dms(slack_token, self_user_id, limit=5)
             if not latest:
-                return JSONResponse({"reply": "I couldn't find any recent incoming Slack DMs."})
+                return JSONResponse(
+                    {
+                        "reply": "I couldn't find any recent incoming Slack DMs.",
+                        "action": {"type": "slack_read_inbox", "status": "empty"},
+                    }
+                )
 
             name_cache: dict[str, str] = {}
             lines = []
@@ -1059,27 +1253,82 @@ async def chat(request: FastAPIRequest, payload: dict):
                 {
                     "reply": "Latest Slack messages sent directly to you:\n"
                     + "\n".join(lines)
-                    + "\n\nTell me what to send with: `reply to @name: your message`.",
+                    + "\n\nTell me what to send and I can draft the reply for confirmation.",
+                    "action": {"type": "slack_read_inbox", "status": "ok"},
                 }
             )
         except Exception as exc:
             logger.exception("Slack inbox lookup failed")
-            return JSONResponse({"reply": f"Slack inbox lookup failed: {exc}"})
+            return JSONResponse(
+                {
+                    "reply": f"Slack inbox lookup failed: {exc}",
+                    "action": {"type": "slack_read_inbox", "status": "failed"},
+                }
+            )
 
-    reply_match = SLACK_REPLY_CMD_RE.match(user_message)
-    if reply_match:
+    if action_type == "slack_read_user":
+        target_name = (planned_action.get("target_name") or "").strip()
+        if not target_name:
+            return JSONResponse({"reply": "Who should I check in Slack?", "action": {"type": "none"}})
         if not slack_token:
-            return JSONResponse({"reply": connect_hint})
-        target_user_id = reply_match.group(2)
-        target_name = (reply_match.group(1) or "").strip()
-        draft_text = (reply_match.group(3) or "").strip()
-        if not draft_text:
-            return JSONResponse({"reply": "Please include a reply message after the colon."})
+            return JSONResponse({"reply": connect_hint, "action": {"type": "slack_read_user", "status": "blocked"}})
         try:
+            target_user_id = _resolve_user_id_from_name(target_name, token=slack_token)
             if not target_user_id:
-                target_user_id = _resolve_user_id_from_name(target_name, token=slack_token)
+                return JSONResponse(
+                    {
+                        "reply": f"I couldn't find Slack user `{target_name}`.",
+                        "action": {"type": "slack_read_user", "status": "missing_target"},
+                    }
+                )
+            dm_message, dm_channel = _get_last_dm_message_from_user(target_user_id, token=slack_token)
+            if not dm_message or not dm_channel:
+                return JSONResponse(
+                    {
+                        "reply": f"I couldn't find a recent Slack DM message from {target_name}.",
+                        "action": {"type": "slack_read_user", "status": "empty"},
+                    }
+                )
+            msg_text = (dm_message.get("text") or "").strip()
+            permalink = _slack_try_get_permalink(dm_channel, dm_message.get("ts"), slack_token)
+            sender_name = _slack_user_display_name(target_user_id, slack_token, {})
+            sender_label = sender_name if sender_name != target_user_id else _clean_requested_name(target_name)
+            reply = f"Last Slack message from {sender_label}:\n{msg_text}"
+            if permalink:
+                reply += f"\n{permalink}"
+            return JSONResponse(
+                {"reply": reply, "action": {"type": "slack_read_user", "status": "ok", "target_name": sender_label}}
+            )
+        except Exception as exc:
+            logger.exception("Slack lookup from /chat failed")
+            return JSONResponse(
+                {
+                    "reply": f"Slack lookup failed: {exc}",
+                    "action": {"type": "slack_read_user", "status": "failed"},
+                }
+            )
+
+    if action_type == "slack_send_message":
+        target_name = (planned_action.get("target_name") or "").strip()
+        draft_text = (planned_action.get("text") or "").strip()
+        if not target_name or not draft_text:
+            return JSONResponse(
+                {
+                    "reply": "Tell me who to message and what to say, and I will draft it for confirmation.",
+                    "action": {"type": "none"},
+                }
+            )
+        if not slack_token:
+            return JSONResponse({"reply": connect_hint, "action": {"type": "slack_send_message", "status": "blocked"}})
+        try:
+            target_user_id = _resolve_user_id_from_name(target_name, token=slack_token)
             if not target_user_id:
-                return JSONResponse({"reply": f"I couldn't find Slack user `{target_name}`."})
+                return JSONResponse(
+                    {
+                        "reply": f"I couldn't find Slack user `{target_name}`.",
+                        "action": {"type": "slack_send_message", "status": "missing_target"},
+                    }
+                )
             resolved_name = _slack_user_display_name(target_user_id, slack_token, {})
             if resolved_name == target_user_id:
                 resolved_name = _clean_requested_name(target_name)
@@ -1087,8 +1336,14 @@ async def chat(request: FastAPIRequest, payload: dict):
             open_data = _slack_api_call("conversations.open", {"users": target_user_id}, token=slack_token)
             channel = (open_data.get("channel") or {}).get("id")
             if not channel:
-                return JSONResponse({"reply": "I couldn't open a DM channel for that user."})
-            session["pending_slack_send"] = {
+                return JSONResponse(
+                    {
+                        "reply": "I couldn't open a DM channel for that user.",
+                        "action": {"type": "slack_send_message", "status": "failed"},
+                    }
+                )
+            session["pending_action"] = {
+                "type": "slack_send_message",
                 "target_user_id": target_user_id,
                 "target_user_label": target_label,
                 "channel": channel,
@@ -1100,12 +1355,48 @@ async def chat(request: FastAPIRequest, payload: dict):
                     "reply": (
                         f"Draft ready to send as you to {target_label}:\n"
                         f"{draft_text}\n\nSay `send it` to confirm or `cancel`."
-                    )
+                    ),
+                    "action": {"type": "slack_send_message", "status": "pending", "target_name": target_label},
                 }
             )
         except Exception as exc:
             logger.exception("Slack reply draft failed")
-            return JSONResponse({"reply": f"Couldn't prepare Slack reply: {exc}"})
+            return JSONResponse(
+                {
+                    "reply": f"Couldn't prepare Slack reply: {exc}",
+                    "action": {"type": "slack_send_message", "status": "failed"},
+                }
+            )
+
+    if action_type == "email_summary":
+        conversation = _conversation_text_from_history(history)
+        if not conversation:
+            return JSONResponse(
+                {
+                    "reply": "I need some conversation history before I can email a summary.",
+                    "action": {"type": "email_summary", "status": "missing_conversation"},
+                }
+            )
+        to_email = (planned_action.get("to") or "").strip() or DEFAULT_TO_EMAIL
+        if not isinstance(to_email, str) or not EMAIL_RE.fullmatch(to_email):
+            return JSONResponse(
+                {
+                    "reply": "What email address should I send the summary to?",
+                    "action": {"type": "none"},
+                }
+            )
+        session["pending_action"] = {
+            "type": "email_summary",
+            "to": to_email,
+            "conversation": conversation,
+            "created_at": int(time.time()),
+        }
+        return JSONResponse(
+            {
+                "reply": f"Summary email is ready for {to_email}. Say `send it` to confirm or `cancel`.",
+                "action": {"type": "email_summary", "status": "pending", "to": to_email},
+            }
+        )
 
     input_messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
     for item in history:
@@ -1124,7 +1415,7 @@ async def chat(request: FastAPIRequest, payload: dict):
     if not reply:
         raise HTTPException(status_code=500, detail="Empty assistant response")
 
-    return JSONResponse({"reply": reply})
+    return JSONResponse({"reply": reply, "action": {"type": "none"}})
 
 
 @app.post("/speak")

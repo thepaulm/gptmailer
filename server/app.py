@@ -8,6 +8,7 @@ import secrets
 import time
 import hmac
 import hashlib
+import difflib
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from datetime import datetime, timezone
@@ -324,10 +325,12 @@ def _extract_target_user_id(command_text: str) -> str | None:
 
 
 def _resolve_user_id_from_name(name: str, token: str | None = None) -> str | None:
-    normalized = (name or "").strip().lower().lstrip("@").rstrip(".,!?")
+    normalized = _normalize_slack_name(name)
     if not normalized:
         return None
 
+    best_match: tuple[float, str] | None = None
+    second_best_score = 0.0
     cursor = None
     for _ in range(20):
         payload = {"limit": 200}
@@ -338,21 +341,77 @@ def _resolve_user_id_from_name(name: str, token: str | None = None) -> str | Non
             profile = member.get("profile", {})
             if member.get("deleted") or member.get("is_bot"):
                 continue
+            member_id = member.get("id")
+            if not member_id:
+                continue
             candidates = {
-                (member.get("name") or "").lower(),
-                (profile.get("display_name") or "").lower(),
-                (profile.get("real_name") or "").lower(),
+                _normalize_slack_name(member.get("name") or ""),
+                _normalize_slack_name(profile.get("display_name") or ""),
+                _normalize_slack_name(profile.get("real_name") or ""),
             }
+            compact_candidates = {_compact_slack_name(candidate) for candidate in candidates if candidate}
+            skeleton_candidates = {_slack_name_skeleton(candidate) for candidate in candidates if candidate}
             if normalized in candidates:
-                return member.get("id")
+                return member_id
+            normalized_compact = _compact_slack_name(normalized)
+            if normalized_compact and normalized_compact in compact_candidates:
+                return member_id
+            normalized_skeleton = _slack_name_skeleton(normalized)
+            if normalized_skeleton and normalized_skeleton in skeleton_candidates:
+                return member_id
             if any(c.startswith(normalized) for c in candidates if c):
-                return member.get("id")
+                return member_id
+            if normalized_compact and any(
+                c.startswith(normalized_compact) for c in compact_candidates if c
+            ):
+                return member_id
+            if normalized_skeleton and any(
+                c.startswith(normalized_skeleton) for c in skeleton_candidates if c
+            ):
+                return member_id
             if any(normalized in c.split() for c in candidates if c):
-                return member.get("id")
+                return member_id
+            score = _score_slack_name_match(normalized, candidates)
+            if score > (best_match[0] if best_match else 0.0):
+                second_best_score = best_match[0] if best_match else second_best_score
+                best_match = (score, member_id)
+            elif score > second_best_score:
+                second_best_score = score
         cursor = (data.get("response_metadata") or {}).get("next_cursor")
         if not cursor:
             break
+    if best_match and best_match[0] >= 0.86 and (best_match[0] - second_best_score) >= 0.05:
+        return best_match[1]
     return None
+
+
+def _normalize_slack_name(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (value or "").strip().lower().lstrip("@").rstrip(".,!?"))
+    return cleaned
+
+
+def _compact_slack_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value or "")
+
+
+def _slack_name_skeleton(value: str) -> str:
+    compacted = _compact_slack_name(value)
+    if not compacted:
+        return ""
+    return compacted[:1] + re.sub(r"[aeiou]", "", compacted[1:])
+
+
+def _score_slack_name_match(query: str, candidates: set[str]) -> float:
+    compact_query = _compact_slack_name(query)
+    best = 0.0
+    for candidate in candidates:
+        if not candidate:
+            continue
+        compact_candidate = _compact_slack_name(candidate)
+        best = max(best, difflib.SequenceMatcher(None, query, candidate).ratio())
+        if compact_query and compact_candidate:
+            best = max(best, difflib.SequenceMatcher(None, compact_query, compact_candidate).ratio())
+    return best
 
 
 def _parse_last_message_target_user_id(command_text: str, token: str | None = None) -> str | None:

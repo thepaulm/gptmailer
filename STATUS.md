@@ -74,6 +74,10 @@ Note: Treat `server/.env` as the source of truth for environment values. If it c
 - For send-on-behalf actions, what explicit confirmation UX is preferred in web chat (single-turn yes/no vs. separate "Send" action)?
 
 ## Completed This Session
+- Loosened Slack name resolution in `server/app.py`:
+  - accepts compact-name matches like `Paul M` -> `paulm`
+  - accepts close vowel variants like `John May` -> `John Mey`
+  - keeps fuzzy fallback conservative to reduce wrong-user matches
 - Reworked `/chat` into the single server-side action router for normal replies, Slack actions, and email-summary requests.
 - Added a structured action-planning prompt in `server/app.py` so the model returns JSON describing the requested action.
 - Added server-side staging and confirmation for summary emails in `/chat`.

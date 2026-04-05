@@ -9,7 +9,7 @@ import time
 import hmac
 import hashlib
 import difflib
-from urllib.parse import urlencode
+from urllib.parse import quote_plus, urlencode
 from urllib.request import Request, urlopen
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +33,8 @@ DEFAULT_TO_EMAIL = os.getenv("DEFAULT_TO_EMAIL")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+GOOGLE_SERVER_CLIENT_ID = os.getenv("GOOGLE_SERVER_CLIENT_ID") or GOOGLE_CLIENT_ID
+GOOGLE_ANDROID_CLIENT_ID = os.getenv("GOOGLE_ANDROID_CLIENT_ID")
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "gptmailer_session")
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
 AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "true").lower() != "false"
@@ -224,8 +226,23 @@ def _json_get(url: str, headers: dict | None = None) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _bearer_token_from_request(request: FastAPIRequest) -> str | None:
+    auth_header = (request.headers.get("authorization") or "").strip()
+    if not auth_header.lower().startswith("bearer "):
+        return None
+    token = auth_header[7:].strip()
+    return token or None
+
+
+def _session_id_from_request(request: FastAPIRequest) -> str | None:
+    cookie_session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if cookie_session_id:
+        return cookie_session_id
+    return _bearer_token_from_request(request)
+
+
 def _session_from_request(request: FastAPIRequest) -> dict | None:
-    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    session_id = _session_id_from_request(request)
     if not session_id:
         return None
     entry = sessions.get(session_id)
@@ -245,6 +262,56 @@ def _require_auth(request: FastAPIRequest) -> dict:
     if not session:
         raise HTTPException(status_code=401, detail="Authentication required")
     return session
+
+
+def _google_allowed_client_ids() -> set[str]:
+    return {
+        value
+        for value in (
+            GOOGLE_CLIENT_ID,
+            GOOGLE_SERVER_CLIENT_ID,
+            GOOGLE_ANDROID_CLIENT_ID,
+        )
+        if value
+    }
+
+
+def _create_session(userinfo: dict, auth_mode: str) -> tuple[str, dict]:
+    session_id = secrets.token_urlsafe(32)
+    session = {
+        "sub": userinfo.get("sub"),
+        "email": userinfo.get("email"),
+        "name": userinfo.get("name"),
+        "picture": userinfo.get("picture"),
+        "expires_at": int(time.time()) + SESSION_TTL_SECONDS,
+        "auth_mode": auth_mode,
+    }
+    sessions[session_id] = session
+    return session_id, session
+
+
+def _google_userinfo_from_id_token(id_token: str) -> dict:
+    token_data = _json_get(
+        f"https://oauth2.googleapis.com/tokeninfo?id_token={quote_plus(id_token)}"
+    )
+    aud = (token_data.get("aud") or "").strip()
+    if aud not in _google_allowed_client_ids():
+        raise HTTPException(status_code=403, detail="Google token audience is not allowed")
+
+    email = (token_data.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Google token did not include an email")
+    if str(token_data.get("email_verified")).lower() not in {"true", "1"}:
+        raise HTTPException(status_code=403, detail="Google email is not verified")
+    if ALLOWED_GOOGLE_EMAIL and email != ALLOWED_GOOGLE_EMAIL:
+        raise HTTPException(status_code=403, detail="This Google account is not allowed")
+
+    return {
+        "sub": token_data.get("sub"),
+        "email": email,
+        "name": token_data.get("name") or email,
+        "picture": token_data.get("picture"),
+    }
 
 
 def _extract_output_text(resp) -> str:
@@ -767,17 +834,22 @@ def auth_google_login():
         raise HTTPException(status_code=500, detail="Google OAuth is not configured")
 
     state = secrets.token_urlsafe(24)
-    params = urlencode(
-        {
-            "client_id": GOOGLE_CLIENT_ID,
-            "redirect_uri": GOOGLE_REDIRECT_URI,
-            "response_type": "code",
-            "scope": "openid email profile",
-            "state": state,
-            "access_type": "offline",
-            "prompt": "consent",
-        }
+    oauth_params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    logger.info(
+        "Starting Google OAuth login client_id=%s redirect_uri=%s auth_cookie_secure=%s",
+        GOOGLE_CLIENT_ID,
+        GOOGLE_REDIRECT_URI,
+        AUTH_COOKIE_SECURE,
     )
+    params = urlencode(oauth_params)
     response = RedirectResponse(
         url=f"https://accounts.google.com/o/oauth2/v2/auth?{params}", status_code=302
     )
@@ -795,6 +867,12 @@ def auth_google_login():
 @app.get("/auth/google/callback")
 def auth_google_callback(request: FastAPIRequest, code: str | None = None, state: str | None = None):
     expected_state = request.cookies.get("g_oauth_state")
+    logger.info(
+        "Google OAuth callback received has_code=%s state_match=%s expected_state_present=%s",
+        bool(code),
+        bool(state and expected_state and state == expected_state),
+        bool(expected_state),
+    )
     if not code or not state or not expected_state or state != expected_state:
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI):
@@ -819,21 +897,14 @@ def auth_google_callback(request: FastAPIRequest, code: str | None = None, state
             headers={"Authorization": f"Bearer {access_token}"},
         )
     except Exception as exc:
-        logger.exception("Google OAuth callback failed")
+        logger.exception("Google OAuth callback failed redirect_uri=%s", GOOGLE_REDIRECT_URI)
         raise HTTPException(status_code=400, detail=f"OAuth exchange failed: {exc}") from exc
 
     user_email = (userinfo.get("email") or "").strip().lower()
     if ALLOWED_GOOGLE_EMAIL and user_email != ALLOWED_GOOGLE_EMAIL:
         raise HTTPException(status_code=403, detail="This Google account is not allowed")
 
-    session_id = secrets.token_urlsafe(32)
-    sessions[session_id] = {
-        "sub": userinfo.get("sub"),
-        "email": userinfo.get("email"),
-        "name": userinfo.get("name"),
-        "picture": userinfo.get("picture"),
-        "expires_at": int(time.time()) + SESSION_TTL_SECONDS,
-    }
+    session_id, _session = _create_session(userinfo, auth_mode="web")
 
     response = RedirectResponse(url="/", status_code=302)
     response.delete_cookie("g_oauth_state")
@@ -846,6 +917,70 @@ def auth_google_callback(request: FastAPIRequest, code: str | None = None, state
         secure=AUTH_COOKIE_SECURE,
     )
     return response
+
+
+@app.get("/auth/mobile/config")
+def auth_mobile_config():
+    return JSONResponse(
+        {
+            "auth_required": AUTH_REQUIRED,
+            "google_sign_in_configured": bool(GOOGLE_SERVER_CLIENT_ID),
+            "google_server_client_id": GOOGLE_SERVER_CLIENT_ID,
+            "google_android_client_id": GOOGLE_ANDROID_CLIENT_ID,
+        }
+    )
+
+
+@app.post("/auth/mobile/google")
+def auth_mobile_google(payload: dict):
+    if not AUTH_REQUIRED:
+        session_id, session = _create_session(
+            {"sub": "anonymous", "email": "anonymous@local", "name": "Anonymous"},
+            auth_mode="mobile",
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "token": session_id,
+                "expires_at": session.get("expires_at"),
+                "user": {
+                    "sub": session.get("sub"),
+                    "email": session.get("email"),
+                    "name": session.get("name"),
+                    "picture": session.get("picture"),
+                },
+            }
+        )
+
+    if not GOOGLE_SERVER_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Mobile Google auth is not configured")
+
+    id_token = (payload.get("id_token") or "").strip()
+    if not id_token:
+        raise HTTPException(status_code=400, detail="Missing Google ID token")
+
+    try:
+        userinfo = _google_userinfo_from_id_token(id_token)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Mobile Google auth failed")
+        raise HTTPException(status_code=400, detail=f"Google token validation failed: {exc}") from exc
+
+    session_id, session = _create_session(userinfo, auth_mode="mobile")
+    return JSONResponse(
+        {
+            "ok": True,
+            "token": session_id,
+            "expires_at": session.get("expires_at"),
+            "user": {
+                "sub": session.get("sub"),
+                "email": session.get("email"),
+                "name": session.get("name"),
+                "picture": session.get("picture"),
+            },
+        }
+    )
 
 
 @app.get("/auth/me")
@@ -863,6 +998,7 @@ def auth_me(request: FastAPIRequest):
                 "name": session.get("name"),
                 "picture": session.get("picture"),
             },
+            "auth_mode": session.get("auth_mode", "web"),
             "slack": {
                 "connected": bool(slack_record.get("access_token")),
                 "user_id": slack_record.get("slack_user_id"),
@@ -874,7 +1010,7 @@ def auth_me(request: FastAPIRequest):
 
 @app.post("/auth/logout")
 def auth_logout(request: FastAPIRequest):
-    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    session_id = _session_id_from_request(request)
     if session_id:
         sessions.pop(session_id, None)
     response = JSONResponse({"ok": True})

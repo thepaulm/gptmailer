@@ -2,6 +2,20 @@
 
 Minimal web app that records audio, transcribes it with OpenAI, and emails a summary via AWS SES when you ask it to email the conversation summary.
 
+## Current Project State
+
+- The original web app is still present and working against the FastAPI backend.
+- A Flutter Android client now exists in `mobile_app/`.
+- Mobile auth is in place: Flutter uses Google Sign-In, exchanges the Google ID token for a backend bearer token, and sends that token on `/auth/me`, `/transcribe`, `/chat`, and `/speak`.
+- Flutter now plays assistant replies from `/speak`; the next mobile feature is Slack OAuth via external browser/deep link.
+
+## Next Time
+
+- Confirm `GOOGLE_SERVER_CLIENT_ID` is set in `server/.env`.
+- Restart the backend after `server/app.py` changes before retesting mobile auth.
+- Run `cd mobile_app && flutter run` and verify Google sign-in plus the full voice-to-chat-to-`/speak` flow on device or emulator.
+- After that, wire Slack OAuth for mobile with an external browser/custom-tab and deep-link return.
+
 ## Setup
 
 1. Install dependencies:
@@ -32,6 +46,8 @@ Fill in:
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
 - `GOOGLE_REDIRECT_URI` (example local: `http://localhost:8000/auth/google/callback`)
+- `GOOGLE_SERVER_CLIENT_ID` (recommended for Flutter/mobile Google sign-in token exchange; defaults to `GOOGLE_CLIENT_ID` if omitted)
+- `GOOGLE_ANDROID_CLIENT_ID` (optional Android client ID reference for mobile config/debugging)
 - `AUTH_REQUIRED` (`true` to require login before API usage)
 - `AUTH_COOKIE_SECURE` (`false` for local HTTP, `true` for HTTPS/EC2)
 - `ALLOWED_GOOGLE_EMAIL` (optional; if set, only this exact Google email can sign in)
@@ -68,12 +84,17 @@ If both `SSL_CERTFILE` and `SSL_KEYFILE` are set, it starts uvicorn with HTTPS.
   - `GET /auth/google/callback`
   - `GET /auth/me`
   - `POST /auth/logout`
+- Mobile auth routes:
+  - `GET /auth/mobile/config`
+  - `POST /auth/mobile/google`
 - Slack user OAuth routes:
   - `GET /auth/slack/login`
   - `GET /auth/slack/callback`
   - `GET /auth/slack/status`
   - `POST /auth/slack/disconnect`
 - Browser mic requires HTTPS on mobile. `http://localhost` works for local testing.
+- Flutter mobile auth now uses Google Sign-In to obtain a Google ID token, then exchanges it for a backend bearer token via `POST /auth/mobile/google`.
+- For the current Flutter client, the most important backend config is `GOOGLE_SERVER_CLIENT_ID`.
 - Click `Start Recording` once to begin a continuous chat session; use `End Chat` to stop.
 - The app auto-submits a turn after a brief pause in speech.
 - `/chat` now acts as the single action router for normal replies, Slack actions, and email-summary requests.
